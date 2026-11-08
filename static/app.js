@@ -32,10 +32,10 @@ function setVisualiserLoading(on, label='Building visualiser'){
 }
 async function api(path, opts={}){
   const headers = {'Content-Type':'application/json', ...(opts.headers||{})};
-  const res = await fetch(path, {...opts, headers});
+  const res = await fetch(path, {...opts, headers, credentials:'same-origin'});
   const txt = await res.text();
   let data; try{ data=txt?JSON.parse(txt):{} }catch{ data={raw:txt}; }
-  if(res.status===401){ showLogin(); throw new Error(data.detail || 'Dashboard password required'); }
+  if(res.status===401){ showLogin(); throw new Error(data.detail || 'Authentication required'); }
   if(!res.ok) throw new Error(data.detail || data.error || res.statusText);
   if(data && (data.ok===false || data.status==='failed')) throw new Error(data.reason || data.error || `${data.tool||'YantrikDB'} failed`);
   return data;
@@ -101,8 +101,18 @@ function setView(view, opts={}){
   if(view==='conflicts') loadConflicts(); if(view==='graph') loadEntities(); if(view==='identity-scope') loadIdentityScope(); if(view==='lifecycle') loadLifecycle(); if(view==='ops') loadHealthPanel(); if(view==='settings') loadSettings();
 }
 
+async function waitForAuthReady(){
+  if(window.yantrikdbAuthReady){
+    await window.yantrikdbAuthReady;
+  }else{
+    await new Promise(resolve=>window.addEventListener('yantrikdb-auth-ready',resolve,{once:true}));
+  }
+  if(window.yantrikdbAuthError) throw new Error(window.yantrikdbAuthError);
+}
+
 async function init(){
-  $$('.nav-item').forEach(b=>b.onclick=()=>setView(b.dataset.view));
+  await waitForAuthReady();
+  $('.nav-item').forEach(b=>b.onclick=()=>setView(b.dataset.view));
   $('#brandHome')?.addEventListener('click',()=>setView('overview'));
   window.addEventListener('popstate',()=>{
     const params=new URLSearchParams(location.search);
@@ -147,8 +157,7 @@ async function init(){
   $('#savePassword')?.addEventListener('click',()=>saveSettings({password:true}));
   $('#disablePassword')?.addEventListener('click',()=>saveSettings({disablePassword:true}));
   $('#logoutBtn')?.addEventListener('click',logout);
-  $('#loginBtn')?.addEventListener('click',login);
-  $('#loginPassword')?.addEventListener('keydown',(e)=>{ if(e.key==='Enter') login(); });
+  $('#signOutButton')?.addEventListener('click',logout);
   window.addEventListener('resize',()=>{ if(state.view==='overview' && state.recentWrites) requestAnimationFrame(()=>drawRecent(state.recentWrites)); });
   try{ await refreshAll(); }catch(e){ toast(e.message); return; }
   const initialView = new URLSearchParams(location.search).get('view') || 'overview';
@@ -475,7 +484,7 @@ function settingsRows(s){
   const y=s.yantrikdb||{};
   const rows=[
     ['Admin mode', s.admin_mode ? 'Enabled' : 'Read-only'],
-    ['Password', s.password_enabled ? 'Enabled' : 'Disabled'],
+    ['Authentication', s.supabase_auth_enabled ? 'Supabase Auth' : (s.password_enabled ? 'Local password' : 'Not configured')],
     ['Backend mode', y.mode || 'embedded'],
     ['Base namespace', y.namespace || 'hermes'],
     ['Default scope', y.default_namespace || s.default_namespace],
@@ -544,18 +553,15 @@ async function saveSettings(opts={}){
   }catch(e){toast(e.message); await loadSettings();}
 }
 
-function showLogin(){ $('#loginModal')?.classList.remove('hidden'); setTimeout(()=>$('#loginPassword')?.focus(),50); }
-function hideLogin(){ $('#loginModal')?.classList.add('hidden'); if($('#loginPassword')) $('#loginPassword').value=''; }
-async function login(){
-  try{
-    await api('/api/auth/login',{method:'POST',body:JSON.stringify({password:$('#loginPassword')?.value||''})});
-    hideLogin(); toast('Unlocked'); await refreshAll();
-    const initialView = new URLSearchParams(location.search).get('view') || state.view || 'overview';
-    setView(initialView,{replace:true,fromUrl:true});
-  }catch(e){ toast(e.message); }
+function showLogin(){
+  if(location.pathname !== '/login') window.location.replace('/login');
 }
 async function logout(){
-  try{ await api('/api/auth/logout',{method:'POST',body:'{}'}); showLogin(); toast('Logged out'); }catch(e){ toast(e.message); }
+  try{
+    if(window.yantrikdbAuth?.signOut) await window.yantrikdbAuth.signOut();
+    else await fetch('/api/auth/session',{method:'DELETE',credentials:'same-origin'});
+    window.location.replace('/login');
+  }catch(e){ toast(e.message || 'Sign out failed'); }
 }
 
 async function loadStats(){
