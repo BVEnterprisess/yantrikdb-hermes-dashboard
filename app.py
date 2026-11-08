@@ -21,9 +21,10 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import requests
 
 try:
     import importlib.metadata as importlib_metadata
@@ -54,6 +55,19 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 ADMIN_MODE_ENV = env_bool("YANTRIKDB_DASHBOARD_ADMIN_MODE", False)
+
+# Supabase Auth protects the dashboard and every application API route. The
+# publishable key is designed for browser use; never place a secret/service-role
+# key in this application configuration.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uhujussjcnoacqhavsqg.supabase.co").strip().rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = os.environ.get(
+    "SUPABASE_PUBLISHABLE_KEY",
+    "sb_publishable_qCDzNwEnGkhfCkHJLbrAcQ_XRp43g_a",
+).strip()
+SUPABASE_AUTH_REDIRECT_URL = os.environ.get("SUPABASE_AUTH_REDIRECT_URL", "").strip()
+SUPABASE_AUTH_ENABLED = bool(SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY)
+SUPABASE_SESSION_COOKIE = "yantrikdb_supabase_access_token"
+SUPABASE_AUTH_VERIFY_TIMEOUT = 8.0
 
 # HTTP backend mode (optional). When YANTRIKDB_SERVER_URL is set the
 # dashboard proxies supported routes to that yantrikdb-server v0.8.17+
@@ -417,6 +431,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class SupabaseSessionRequest(BaseModel):
+    access_token: str = Field(min_length=1, max_length=8192)
+    expires_in: int = Field(default=3600, ge=60, le=86400)
+
+
 class SettingsRequest(BaseModel):
     admin_mode: bool
     new_password: Optional[str] = None
@@ -441,10 +460,63 @@ class IdentityScopeRequest(BaseModel):
     identity_scope: dict[str, Any]
 
 
+def verify_supabase_access_token(access_token: str) -> bool | None:
+    """Ask Supabase Auth to validate an access token.
+
+    Returns True for a valid user token, False for an invalid token, and None
+    when the Auth service cannot be reached so callers can distinguish an
+    upstream outage from an expired or malformed session.
+    """
+    if not SUPABASE_AUTH_ENABLED or not access_token:
+        return False
+    try:
+        response = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            },
+            timeout=SUPABASE_AUTH_VERIFY_TIMEOUT,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code != 200:
+        return False
+    try:
+        user = response.json()
+    except ValueError:
+        return False
+    return isinstance(user, dict) and bool(user.get("id"))
+
+
 @app.middleware("http")
 async def password_gate(request: Request, call_next):
     path = request.url.path
-    if path.startswith("/api/") and not path.startswith("/api/auth/"):
+    public_paths = {
+        "/login",
+        "/api/auth/config",
+        "/api/auth/session",
+    }
+    is_public = path in public_paths or path.startswith("/static/")
+
+    if SUPABASE_AUTH_ENABLED and not is_public:
+        access_token = request.cookies.get(SUPABASE_SESSION_COOKIE, "")
+        if not access_token:
+            if path.startswith("/api/"):
+                return JSONResponse(status_code=401, content={"detail": "Supabase authentication required"})
+            return RedirectResponse(url="/login", status_code=303)
+        valid = verify_supabase_access_token(access_token)
+        if valid is None:
+            return JSONResponse(status_code=503, content={"detail": "Supabase Auth is temporarily unavailable"})
+        if not valid:
+            if path.startswith("/api/"):
+                return JSONResponse(status_code=401, content={"detail": "Supabase session expired; sign in again"})
+            return RedirectResponse(url="/login", status_code=303)
+        request.state.supabase_authenticated = True
+    elif path.startswith("/api/") and path not in public_paths:
+        # Retain the local password gate for deployments that intentionally
+        # disable Supabase Auth during development.
         settings = load_dashboard_settings()
         if password_enabled(settings) and not is_authenticated(request, settings):
             return JSONResponse(status_code=401, content={"detail": "Dashboard password required"})
@@ -454,6 +526,54 @@ async def password_gate(request: Request, call_next):
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/login")
+def login_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "login.html")
+
+
+@app.get("/api/auth/config")
+def supabase_auth_config() -> dict[str, Any]:
+    return {
+        "enabled": SUPABASE_AUTH_ENABLED,
+        "url": SUPABASE_URL if SUPABASE_AUTH_ENABLED else "",
+        "publishable_key": SUPABASE_PUBLISHABLE_KEY if SUPABASE_AUTH_ENABLED else "",
+        "redirect_url": SUPABASE_AUTH_REDIRECT_URL or None,
+    }
+
+
+@app.post("/api/auth/session")
+def create_supabase_session(req: SupabaseSessionRequest, request: Request) -> Response:
+    valid = verify_supabase_access_token(req.access_token)
+    if valid is None:
+        raise HTTPException(503, "Supabase Auth is temporarily unavailable")
+    if not valid:
+        raise HTTPException(401, "Supabase access token is invalid or expired")
+    response = JSONResponse({"ok": True, "authenticated": True})
+    response.set_cookie(
+        SUPABASE_SESSION_COOKIE,
+        req.access_token,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        max_age=min(req.expires_in, 3600),
+        path="/",
+    )
+    return response
+
+
+@app.delete("/api/auth/session")
+def delete_supabase_session(request: Request) -> Response:
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(
+        SUPABASE_SESSION_COOKIE,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        path="/",
+    )
+    return response
 
 
 @app.get("/api/health")
@@ -851,6 +971,7 @@ def get_settings(request: Request) -> dict[str, Any]:
     stored = load_dashboard_settings()
     return {
         "admin_mode": admin_mode_enabled(),
+        "supabase_auth_enabled": SUPABASE_AUTH_ENABLED,
         "admin_mode_env": ADMIN_MODE_ENV,
         "admin_mode_stored": bool(stored.get("admin_mode")),
         "password_enabled": password_enabled(stored),
@@ -922,7 +1043,11 @@ def update_settings(req: SettingsRequest, request: Request) -> Response:
 @app.get("/api/auth/status")
 def auth_status(request: Request) -> dict[str, Any]:
     settings = load_dashboard_settings()
-    return {"password_required": password_enabled(settings), "authenticated": is_authenticated(request, settings)}
+    return {
+        "password_required": password_enabled(settings),
+        "authenticated": is_authenticated(request, settings),
+        "supabase_auth_enabled": SUPABASE_AUTH_ENABLED,
+    }
 
 
 @app.post("/api/auth/login")
