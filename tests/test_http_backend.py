@@ -1,383 +1,310 @@
-"""Tests for the HTTP backend mode added in v0.2.0.
-
-Two layers:
-
-- ``HTTPBackend`` unit tests: mock the underlying ``requests.Session.request``
-  so we verify the wire shape (URL, params, headers, error mapping) without
-  touching a live server.
-- ``app`` route guard tests: install a stub backend with
-  ``monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)`` and hit the FastAPI
-  app via ``TestClient`` to confirm the early-return wiring + the SQL-fallthrough
-  guard in ``connect()`` both behave correctly.
-"""
 from __future__ import annotations
 
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import requests
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import app as dashboard
-from backend import HTTPBackend, NotImplementedHTTPBackend, make_backend
+from backend import DEFAULT_SERVER_URL, HTTPBackend, YantrikDBHTTPError, make_backend
 
 
-# ----- HTTPBackend unit tests -----
+class FakeResponse:
+    def __init__(self, status_code: int = 200, body: Any = None, text: str = "") -> None:
+        self.status_code = status_code
+        self._body = body
+        self.text = text or (str(body) if body is not None else "")
+        self.reason_phrase = "upstream error"
+        self.content = b"" if status_code == 204 else (b"{}" if body is None else b"body")
+
+    def json(self) -> Any:
+        if self._body is _NO_JSON:
+            raise ValueError("not json")
+        return self._body
 
 
-def _fake_response(status_code: int = 200, body: Any = None, text: str = "") -> MagicMock:
-    resp = MagicMock()
-    resp.status_code = status_code
-    resp.content = b"x" if status_code != 204 else b""
-    if body is not None:
-        resp.json.return_value = body
-    else:
-        resp.json.side_effect = ValueError("no json")
-    resp.text = text or (str(body) if body else "")
-    return resp
+_NO_JSON = object()
 
 
-def test_make_backend_returns_none_when_env_unset(monkeypatch):
+def install_response(backend: HTTPBackend, response: FakeResponse) -> MagicMock:
+    request = MagicMock(return_value=response)
+    backend._session.request = request
+    return request
+
+
+def test_make_backend_uses_http_default_and_server_side_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("YANTRIKDB_SERVER_URL", raising=False)
-    assert make_backend() is None
-
-
-def test_make_backend_returns_instance_when_env_set(monkeypatch):
-    monkeypatch.setenv("YANTRIKDB_SERVER_URL", "http://cluster:7438")
-    monkeypatch.setenv("YANTRIKDB_TOKEN", "ydb_test")
+    monkeypatch.setenv("YANTRIKDB_TOKEN", "server-secret")
     backend = make_backend()
     assert isinstance(backend, HTTPBackend)
-    assert backend.base_url == "http://cluster:7438"
-    assert backend._session.headers.get("Authorization") == "Bearer ydb_test"
+    assert backend.base_url == DEFAULT_SERVER_URL == "http://127.0.0.1:7438"
+    assert backend._session.headers["Authorization"] == "Bearer server-secret"
 
 
-def test_backend_strips_trailing_slash_and_picks_first_url():
-    backend = HTTPBackend("http://a:7438/, http://b:7438/")
-    assert backend.base_url == "http://a:7438"
+def test_make_backend_uses_configured_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YANTRIKDB_SERVER_URL", "https://db.example.test:7438/")
+    monkeypatch.delenv("YANTRIKDB_TOKEN", raising=False)
+    backend = make_backend()
+    assert backend.base_url == "https://db.example.test:7438"
+    assert "Authorization" not in backend._session.headers
 
 
-def test_request_404_maps_to_501_with_issue_link(monkeypatch):
-    backend = HTTPBackend("http://cluster:7438")
-    monkeypatch.setattr(backend._session, "request", lambda *a, **kw: _fake_response(404))
-    with pytest.raises(Exception) as exc:
-        backend.list_memories(namespace="default")
-    assert exc.value.status_code == 501
-    assert "issues/39" in exc.value.detail
-    assert "/v1/memories" in exc.value.detail
+@pytest.mark.parametrize("url", [
+    "file:///tmp/data", "http://user:pass@example.test", "http://example.test/path?query=1",
+    "http://example.test/#fragment", "not a url", "//example.test:7438",
+])
+def test_backend_rejects_unsafe_or_invalid_base_urls(url: str) -> None:
+    with pytest.raises(ValueError, match="YANTRIKDB_SERVER_URL"):
+        HTTPBackend(url)
 
 
-def test_request_other_4xx_surfaces_server_error_message(monkeypatch):
-    backend = HTTPBackend("http://cluster:7438")
-    body = {"error": {"message": "bad namespace"}}
-    monkeypatch.setattr(backend._session, "request", lambda *a, **kw: _fake_response(400, body))
-    with pytest.raises(Exception) as exc:
-        backend.stats(namespace="default")
+def test_request_uses_bearer_session_and_disables_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438", "token-123")
+    request = install_response(backend, FakeResponse(body={"status": "ok"}))
+    assert backend.health(default_namespace="default")["ok"] is True
+    args, kwargs = request.call_args
+    assert args[:2] == ("GET", "http://server:7438/v1/health")
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["timeout"] == (3.0, 15.0)
+    assert backend._session.headers["Authorization"] == "Bearer token-123"
+
+
+def test_upstream_json_error_status_and_body_are_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    payload = {"error": {"code": "INVALID_QUERY_PARAMETER", "message": "source filter unsupported"}}
+    install_response(backend, FakeResponse(400, payload))
+    with pytest.raises(YantrikDBHTTPError) as exc:
+        backend.list_memories(namespace="default", source="user")
     assert exc.value.status_code == 400
-    assert "bad namespace" in exc.value.detail
+    assert exc.value.payload == payload
 
 
-def test_request_connection_error_maps_to_502(monkeypatch):
-    import requests as _r
-    backend = HTTPBackend("http://cluster:7438")
-    def raise_conn(*a, **kw):
-        raise _r.ConnectionError("refused")
-    monkeypatch.setattr(backend._session, "request", raise_conn)
-    with pytest.raises(Exception) as exc:
-        backend.health()
+def test_upstream_non_json_error_is_retained_as_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    install_response(backend, FakeResponse(502, _NO_JSON, "bad gateway"))
+    with pytest.raises(YantrikDBHTTPError) as exc:
+        backend.health(default_namespace="default")
+    assert exc.value.status_code == 502
+    assert exc.value.payload == {"detail": "bad gateway"}
+
+
+def test_redirect_is_rejected_without_following(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438", "secret")
+    request = install_response(backend, FakeResponse(302, {"location": "http://evil.test"}))
+    with pytest.raises(HTTPException) as exc:
+        backend.health(default_namespace="default")
+    assert exc.value.status_code == 502
+    assert "unexpected redirect" in exc.value.detail
+    assert request.call_args.kwargs["allow_redirects"] is False
+
+
+def test_connection_failure_is_a_502_and_redacts_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438", "secret-token")
+    request = MagicMock(side_effect=requests.ConnectionError("failed secret-token"))
+    backend._session.request = request
+    with pytest.raises(HTTPException) as exc:
+        backend.health(default_namespace="default")
     assert exc.value.status_code == 502
     assert "unreachable" in exc.value.detail
+    assert "secret-token" not in exc.value.detail
 
 
-def test_health_adapts_cluster_response(monkeypatch):
-    backend = HTTPBackend("http://cluster:7438")
-    server_body = {
-        "status": "ok",
-        "cluster": {"healthy": True, "leader": 4, "node_id": 4, "role": "Leader", "term": 27077, "raft_mode": "openraft"},
-        "engines_loaded": 7,
+def test_response_token_echo_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438", "secret-token")
+    install_response(backend, FakeResponse(401, {"detail": "echo secret-token", "nested": ["secret-token"]}))
+    with pytest.raises(YantrikDBHTTPError) as exc:
+        backend.list_memories(namespace="default")
+    assert exc.value.payload == {"detail": "echo [redacted]", "nested": ["[redacted]"]}
+
+
+def test_successful_response_must_be_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    install_response(backend, FakeResponse(200, _NO_JSON, "plain text"))
+    with pytest.raises(HTTPException) as exc:
+        backend.health(default_namespace="default")
+    assert exc.value.status_code == 502
+    assert "non-JSON response" in exc.value.detail
+
+
+def test_health_adapts_only_fields_present_in_server_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    install_response(backend, FakeResponse(body={
+        "status": "ok", "engines_loaded": 3, "capabilities": ["idempotency_key"],
+        "cluster": {"healthy": True, "leader": 4, "role": "Leader"},
+    }))
+    result = backend.health(default_namespace="my-default")
+    assert result["ok"] is True
+    assert result["mode"] == "http"
+    assert result["default_namespace"] == "my-default"
+    assert result["server_url"] == "http://server:7438"
+    assert result["cluster"]["role"] == "Leader"
+    assert result["engines_loaded"] == 3
+    assert result["capabilities"] == ["idempotency_key"]
+    assert result["namespaces"] == []  # health does not claim a row-tag inventory
+
+
+def test_stats_is_database_wide_and_does_not_send_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(body={"active_memories": 13, "open_conflicts": 2, "entities": 4, "edges": 5}))
+    result = backend.stats()
+    assert result["namespace_filter_supported"] is False
+    assert result["engine"]["active_memories"] == 13
+    assert result["open_conflicts"] == 2
+    assert request.call_args.args[0:2] == ("GET", "http://server:7438/v1/stats")
+    assert request.call_args.kwargs["params"] is None
+
+
+def test_identity_scope_is_passed_through_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    payload = {"effective_scope": {"namespaces": ["tenant-a"]}, "namespace_inventory": [{"namespace": "tenant-a", "count": None, "mapped": False}]}
+    request = install_response(backend, FakeResponse(body=payload))
+    assert backend.identity_scope() == payload
+    assert request.call_args.args[0:2] == ("GET", "http://server:7438/v1/identity-scope")
+
+
+def test_namespace_filter_uses_opaque_row_tags_and_only_omits_dashboard_sentinel(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    for tag in ("project-alpha", "all", "*", "", "__ALL__"):
+        request = install_response(backend, FakeResponse(body={"items": [], "total": 0, "limit": 50, "offset": 0}))
+        backend.list_memories(namespace=tag)
+        assert request.call_args.kwargs["params"]["namespace"] == tag
+
+    for sentinel in ("__all__", None):
+        request = install_response(backend, FakeResponse(body={"items": [], "total": 0, "limit": 50, "offset": 0}))
+        backend.list_memories(namespace=sentinel)
+        assert "namespace" not in request.call_args.kwargs["params"]
+
+
+def test_memory_list_uses_supported_v020_query_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(body={"items": [], "total": 0, "limit": 25, "offset": 5}))
+    backend.list_memories(namespace="project-alpha", domain="work", memory_type="semantic", limit=25, offset=5, sort="importance")
+    params = request.call_args.kwargs["params"]
+    assert params == {"status": "active", "limit": 25, "offset": 5, "sort": "importance", "namespace": "project-alpha", "domain": "work", "memory_type": "semantic"}
+    assert "q" not in params and "source" not in params
+
+
+def test_memory_list_does_not_hide_server_400_for_unsupported_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(400, {"error": "source filter is not implemented"}))
+    with pytest.raises(YantrikDBHTTPError) as exc:
+        backend.list_memories(namespace="default", source="user")
+    assert exc.value.status_code == 400
+    assert "source filter" in exc.value.payload["error"]
+    assert request.call_args.kwargs["params"]["source"] == "user"
+
+
+def test_memory_detail_quotes_rid_and_keeps_generic_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(body={"rid": "a/b?c", "namespace": "project-alpha"}))
+    result = backend.get_memory("a/b?c", namespace="project-alpha")
+    assert result["rid"] == "a/b?c"
+    assert request.call_args.args[1] == "http://server:7438/v1/memory/a%2Fb%3Fc"
+    assert request.call_args.kwargs["params"] == {"namespace": "project-alpha"}
+
+
+def test_recall_payload_uses_supported_v020_fields_and_skips_reinforcement(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(body={"results": []}))
+    backend.recall(
+        query="dashboard", top_k=12, namespace="project-alpha", domain="ops", source="user",
+        include_consolidated=True, expand_entities=True,
+    )
+    assert request.call_args.args[0:2] == ("POST", "http://server:7438/v1/recall")
+    assert request.call_args.kwargs["json"] == {
+        "query": "dashboard", "top_k": 12, "include_consolidated": True,
+        "expand_entities": True, "skip_reinforce": True,
+        "namespace": "project-alpha", "domain": "ops", "source": "user",
     }
-    monkeypatch.setattr(backend._session, "request", lambda *a, **kw: _fake_response(200, server_body))
-    body = backend.health()
-    assert body["ok"] is True
-    assert body["mode"] == "http"
-    assert body["server_url"] == "http://cluster:7438"
-    assert body["cluster"]["role"] == "Leader"
-    assert body["engines_loaded"] == 7
 
 
-def test_list_memories_forwards_filter_params(monkeypatch):
-    backend = HTTPBackend("http://cluster:7438")
-    captured: dict[str, Any] = {}
-    def capture(method, url, **kwargs):
-        captured["method"] = method
-        captured["url"] = url
-        captured["params"] = kwargs.get("params")
-        return _fake_response(200, {"total": 0, "items": []})
-    monkeypatch.setattr(backend._session, "request", capture)
-    backend.list_memories(
-        namespace="default", status="active", domain="work", source="user",
-        memory_type="semantic", q="alpha", limit=25, offset=10, sort="importance",
-    )
-    assert captured["method"] == "GET"
-    assert captured["url"].endswith("/v1/memories")
-    p = captured["params"]
-    assert p["namespace"] == "default"
-    assert p["domain"] == "work"
-    assert p["source"] == "user"
-    # yantrikdb-server /v1/memories filter is `memory_type` (NOT `type` —
-    # the engine table column is `type` but the HTTP query param mirrors
-    # the dashboard's own parameter name so the contract stays consistent
-    # across SQLite and HTTP modes).
-    assert p["memory_type"] == "semantic"
-    assert "type" not in p
-    assert p["q"] == "alpha"
-    assert p["limit"] == 25
-    assert p["offset"] == 10
-    assert p["sort"] == "importance"
+def test_conflict_list_and_resolve_follow_v020_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    list_request = install_response(backend, FakeResponse(body={"conflicts": [{"conflict_id": "c1"}], "count": 1}))
+    result = backend.conflicts(namespace="project-alpha", status="open", limit=15)
+    assert result["items"] == [{"conflict_id": "c1"}]
+    assert list_request.call_args.args[1] == "http://server:7438/v1/conflicts"
+    assert list_request.call_args.kwargs["params"] == {"limit": 15, "namespace": "project-alpha", "status": "open"}
+
+    resolve_request = install_response(backend, FakeResponse(body={"status": "resolved"}))
+    backend.resolve_conflict("c/1", payload={"strategy": "dismiss", "resolution_note": "reviewed"})
+    assert resolve_request.call_args.args[1] == "http://server:7438/v1/conflicts/c%2F1/resolve"
+    assert resolve_request.call_args.kwargs["json"] == {"strategy": "dismiss", "resolution_note": "reviewed"}
 
 
-def test_list_memories_omits_empty_filters(monkeypatch):
-    backend = HTTPBackend("http://cluster:7438")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(backend._session, "request", lambda m, u, **kw: (captured.update(kw), _fake_response(200, {}))[1])
-    backend.list_memories(namespace="default")
-    p = captured["params"]
-    assert "domain" not in p
-    assert "source" not in p
-    assert "type" not in p
-    assert "memory_type" not in p
-    assert "q" not in p
-    assert p["namespace"] == "default"
+def test_think_is_server_wide_and_refuses_specific_row_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(body={"ok": True}))
+    result = backend.think(payload={"run_consolidation": True}, namespace="__all__")
+    assert result["ok"] is True
+    assert request.call_args.args[0:2] == ("POST", "http://server:7438/v1/think")
+    assert request.call_args.kwargs["json"] == {"run_consolidation": True}
+    for namespace in ("project-alpha", "all", "*", ""):
+        with pytest.raises(HTTPException) as exc:
+            backend.think(payload={}, namespace=namespace)
+        assert exc.value.status_code == 501
+        assert "does not accept a namespace" in exc.value.detail
+    assert request.call_count == 1
 
 
-def test_get_memory_forwards_namespace(monkeypatch):
-    """Cluster-wide / admin tokens require an explicit namespace on
-    /v1/memory/{rid}; pinned tokens can only read their own. Without
-    it the detail drawer can 400/403 in HTTP mode."""
-    backend = HTTPBackend("http://cluster:7438")
-    captured: dict[str, Any] = {}
-    def capture(method, url, **kwargs):
-        captured["method"] = method
-        captured["url"] = url
-        captured["params"] = kwargs.get("params")
-        return _fake_response(200, {"rid": "r1", "text": "hello"})
-    monkeypatch.setattr(backend._session, "request", capture)
-    backend.get_memory("r1", namespace="hermes:hermes:default")
-    assert captured["method"] == "GET"
-    assert captured["url"].endswith("/v1/memory/r1")
-    assert captured["params"] == {"namespace": "hermes:hermes:default"}
+def test_forget_posts_rid_and_row_namespace_to_v020_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(body={"rid": "r1", "found": True}))
+    backend.forget("r1", namespace="project-alpha")
+    assert request.call_args.args[0:2] == ("POST", "http://server:7438/v1/forget")
+    assert request.call_args.kwargs["json"] == {"rid": "r1", "namespace": "project-alpha"}
 
 
-def test_phase_2_3_methods_raise_not_implemented():
-    backend = HTTPBackend("http://cluster:7438")
-    for method in ("recall", "conflicts", "identity_scope", "entities", "graph",
-                   "sessions", "stale", "upcoming", "patterns", "triggers",
-                   "export_memories", "constellation", "think", "forget"):
-        with pytest.raises(NotImplementedHTTPBackend):
-            getattr(backend, method)()
+def test_temporal_routes_normalize_memories_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(body={"memories": [{"rid": "r1"}], "count": 1}))
+    result = backend.temporal("stale", namespace="personal", days=30, limit=20)
+    assert result["items"] == [{"rid": "r1"}]
+    assert request.call_args.args[1] == "http://server:7438/v1/temporal/stale"
+    assert request.call_args.kwargs["params"] == {"days": 30, "limit": 20, "namespace": "personal"}
 
 
-# ----- app.py route-guard tests -----
+def test_trigger_routes_and_action_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    request = install_response(backend, FakeResponse(body={"triggers": [{"id": "t1"}]}))
+    assert backend.triggers(limit=12)["items"] == [{"id": "t1"}]
+    assert request.call_args.args[1] == "http://server:7438/v1/triggers"
+    assert request.call_args.kwargs["params"] == {"limit": 12}
+    history_request = install_response(backend, FakeResponse(body={"triggers": [{"id": "t2"}]}))
+    assert backend.trigger_history(limit=14, trigger_type="reminder")["items"] == [{"id": "t2"}]
+    assert history_request.call_args.args[1] == "http://server:7438/v1/triggers/history"
+    assert history_request.call_args.kwargs["params"] == {"limit": 14, "trigger_type": "reminder"}
+    action_request = install_response(backend, FakeResponse(body={"ok": True}))
+    backend.trigger_action("t/1", "acknowledge")
+    assert action_request.call_args.args[1] == "http://server:7438/v1/triggers/t%2F1/acknowledge"
+    with pytest.raises(HTTPException) as exc:
+        backend.trigger_action("t1", "invented")
+    assert exc.value.status_code == 400
 
 
-def test_health_route_uses_http_backend_when_set(monkeypatch):
-    stub = MagicMock(spec=HTTPBackend)
-    stub.health.return_value = {"ok": True, "mode": "http", "server_url": "http://x:7438"}
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)
+def test_skill_search_detail_and_outcome_routes(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    search_request = install_response(backend, FakeResponse(body={"results": []}))
+    backend.skill_search(query="review", top_k=8, applies_to="python")
+    assert search_request.call_args.args[1] == "http://server:7438/v1/skills/search"
+    assert search_request.call_args.kwargs["json"] == {"query": "review", "top_k": 8, "applies_to": ["python"]}
+    detail_request = install_response(backend, FakeResponse(body={"skill_id": "review-contract", "body": "text"}))
+    backend.get_skill("review/contract")
+    assert detail_request.call_args.args[1] == "http://server:7438/v1/skills/review%2Fcontract"
+    outcome_request = install_response(backend, FakeResponse(body={"ok": True}))
+    backend.record_skill_outcome("review-contract", success=False, context="fixture")
+    assert outcome_request.call_args.args[1] == "http://server:7438/v1/skills/review-contract/outcome"
+    assert outcome_request.call_args.kwargs["json"] == {"success": False, "context": "fixture"}
+
+
+def test_app_error_handler_preserves_upstream_status_and_error_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = HTTPBackend("http://server:7438")
+    install_response(backend, FakeResponse(404, {"error": {"code": "NOT_FOUND", "message": "missing skill"}}))
+    monkeypatch.setattr(dashboard, "HTTP_BACKEND", backend)
     client = TestClient(dashboard.app)
     response = client.get("/api/health")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["mode"] == "http"
-    assert body["server_url"] == "http://x:7438"
-    # The dashboard injects its env-derived namespaces into the HTTP-mode
-    # health call so the frontend can default the namespace selector to a
-    # real namespace instead of sending __all__ to /v1/stats (which would 400).
-    call_kwargs = stub.health.call_args.kwargs
-    assert call_kwargs["base_namespace"] == dashboard.BASE_NAMESPACE
-    assert call_kwargs["default_namespace"] == dashboard.DEFAULT_NAMESPACE
-
-
-def test_http_health_includes_base_and_default_namespace():
-    """End-to-end: HTTPBackend.health() includes the dashboard's
-    base_namespace + default_namespace so the frontend has a real fallback
-    in HTTP mode where local-namespace enumeration isn't available."""
-    backend = HTTPBackend("http://cluster:7438")
-    import requests
-    server_body = {"status": "ok", "cluster": {"healthy": True, "role": "Leader"}}
-    # monkey-patch via the session directly
-    real_request = backend._session.request
-
-    def stub(method, url, **kwargs):  # type: ignore[no-untyped-def]
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.content = b"x"
-        resp.json.return_value = server_body
-        return resp
-
-    backend._session.request = stub  # type: ignore[method-assign]
-    try:
-        body = backend.health(
-            base_namespace="hermes",
-            default_namespace="hermes:hermes:default",
-        )
-    finally:
-        backend._session.request = real_request  # type: ignore[method-assign]
-    assert body["base_namespace"] == "hermes"
-    assert body["default_namespace"] == "hermes:hermes:default"
-
-
-def test_stats_route_uses_http_backend_when_set(monkeypatch):
-    stub = MagicMock(spec=HTTPBackend)
-    stub.stats.return_value = {"namespace": "default", "open_conflicts": 5, "engine": {}}
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)
-    client = TestClient(dashboard.app)
-    response = client.get("/api/stats?namespace=default")
-    assert response.status_code == 200
-    assert response.json()["open_conflicts"] == 5
-    stub.stats.assert_called_once_with("default")
-
-
-def test_memories_route_uses_http_backend_when_set(monkeypatch):
-    stub = MagicMock(spec=HTTPBackend)
-    stub.list_memories.return_value = {"total": 1, "items": [{"rid": "r1"}]}
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)
-    client = TestClient(dashboard.app)
-    response = client.get("/api/memories?namespace=default&domain=work&limit=5")
-    assert response.status_code == 200
-    assert response.json()["total"] == 1
-    call_kwargs = stub.list_memories.call_args.kwargs
-    assert call_kwargs["namespace"] == "default"
-    assert call_kwargs["domain"] == "work"
-    assert call_kwargs["limit"] == 5
-
-
-def test_memory_detail_route_uses_http_backend_when_set(monkeypatch):
-    stub = MagicMock(spec=HTTPBackend)
-    stub.get_memory.return_value = {"rid": "r1", "text": "hello"}
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)
-    client = TestClient(dashboard.app)
-    response = client.get("/api/memory/r1?namespace=tenant:ns")
-    assert response.status_code == 200
-    assert response.json()["rid"] == "r1"
-    stub.get_memory.assert_called_once_with("r1", namespace="tenant:ns")
-
-
-def test_memory_detail_route_defaults_namespace_when_omitted(monkeypatch):
-    """Frontend should pass namespace, but if omitted (older clients) we
-    fall back to the dashboard's configured default rather than sending
-    nothing to a server that would 400."""
-    stub = MagicMock(spec=HTTPBackend)
-    stub.get_memory.return_value = {"rid": "r1"}
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)
-    client = TestClient(dashboard.app)
-    response = client.get("/api/memory/r1")
-    assert response.status_code == 200
-    stub.get_memory.assert_called_once_with("r1", namespace=dashboard.DEFAULT_NAMESPACE)
-
-
-def test_connect_raises_501_in_http_mode(monkeypatch):
-    stub = MagicMock(spec=HTTPBackend)
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)
-    with pytest.raises(Exception) as exc:
-        dashboard.connect()
-    assert exc.value.status_code == 501
-    assert "issues/39" in exc.value.detail
-
-
-def test_unwrapped_route_returns_501_via_connect_guard(monkeypatch):
-    """Routes we haven't wrapped (e.g. /api/entities) still call connect()/
-    rows() internally. The guard in connect() turns SQL fallthrough into a
-    clean 501 instead of a confusing 500 in HTTP mode."""
-    stub = MagicMock(spec=HTTPBackend)
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)
-    monkeypatch.setattr(dashboard, "ADMIN_MODE_ENV", True)  # bypass password gate if any
-    client = TestClient(dashboard.app)
-    for path in ("/api/entities", "/api/patterns", "/api/triggers", "/api/sessions"):
-        response = client.get(path)
-        assert response.status_code == 501, f"{path} should 501 in HTTP mode"
-        assert "issues/39" in response.json()["detail"]
-
-
-def test_engine_first_routes_501_when_local_engine_present(monkeypatch):
-    """Regression for wysie's review: several routes called engine()
-    before any SQL helper, so they bypassed the connect() guard and
-    silently returned local-engine data while the dashboard was
-    supposedly in HTTP cluster mode. These per-route HTTP_BACKEND guards
-    fix that and must hold even when a usable engine handle exists.
-    """
-    stub = MagicMock(spec=HTTPBackend)
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", stub)
-    monkeypatch.setattr(dashboard, "ADMIN_MODE_ENV", True)
-
-    # Pre-populate _db_handle with a fake engine that would happily serve
-    # results if a route slipped through. The guard must short-circuit
-    # before any engine method is touched.
-    fake_engine = MagicMock()
-    fake_engine.get_conflicts.return_value = [{"conflict_id": "leaked"}]
-    fake_engine.get_conflict.return_value = {"conflict_id": "leaked"}
-    fake_engine.resolve_conflict.return_value = {"ok": True}
-    fake_engine.recall_with_response.return_value = {"results": [{"rid": "leaked"}]}
-    fake_engine.think.return_value = {"ok": True}
-    fake_engine.forget.return_value = True
-    fake_engine.stale.return_value = [{"rid": "leaked"}]
-    fake_engine.upcoming.return_value = [{"rid": "leaked"}]
-    fake_engine.get_edges.return_value = [{"src": "a", "dst": "b"}]
-    monkeypatch.setattr(dashboard, "_db_handle", fake_engine)
-    monkeypatch.setattr(dashboard, "engine", lambda: fake_engine)
-
-    client = TestClient(dashboard.app)
-
-    get_paths = (
-        "/api/conflicts",
-        "/api/conflicts/c1",
-        "/api/stale",
-        "/api/upcoming",
-        "/api/graph/some_entity",
-        "/api/identity-scope",
-        "/api/constellation",
-        "/api/export/memories.jsonl",
-    )
-    for path in get_paths:
-        response = client.get(path)
-        assert response.status_code == 501, f"{path} should 501 in HTTP mode, got {response.status_code}"
-        assert "issues/39" in response.json()["detail"]
-
-    post_paths = (
-        ("/api/recall", {"query": "anything"}),
-        ("/api/think", {}),
-        ("/api/memory/r1/forget", {}),
-        ("/api/conflicts/c1/resolve", {"strategy": "keep_a", "winner_rid": "r1"}),
-    )
-    for path, body in post_paths:
-        response = client.post(path, json=body)
-        assert response.status_code == 501, f"{path} should 501 in HTTP mode, got {response.status_code}"
-        assert "issues/39" in response.json()["detail"]
-
-    # And: none of those guards ever reached the fake engine.
-    fake_engine.get_conflicts.assert_not_called()
-    fake_engine.get_conflict.assert_not_called()
-    fake_engine.resolve_conflict.assert_not_called()
-    fake_engine.recall_with_response.assert_not_called()
-    fake_engine.think.assert_not_called()
-    fake_engine.forget.assert_not_called()
-    fake_engine.stale.assert_not_called()
-    fake_engine.upcoming.assert_not_called()
-    fake_engine.get_edges.assert_not_called()
-
-
-def test_sqlite_mode_still_works_when_http_backend_unset(monkeypatch, tmp_path):
-    """Sanity check: with HTTP_BACKEND=None the existing SQLite path runs
-    unchanged. This is the no-regression case for default deployments."""
-    db_path = tmp_path / "yantrikdb.db"
-    import sqlite3
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("CREATE TABLE memories (rid TEXT PRIMARY KEY, namespace TEXT)")
-        conn.execute("INSERT INTO memories VALUES (?, ?)", ("r1", "default"))
-    monkeypatch.setattr(dashboard, "DB_PATH", db_path)
-    monkeypatch.setattr(dashboard, "HTTP_BACKEND", None)
-    client = TestClient(dashboard.app)
-    response = client.get("/api/health")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["db_exists"] is True
-    assert body.get("mode") != "http"  # sqlite path doesn't set 'mode'
+    assert response.status_code == 404
+    assert response.json() == {"error": {"code": "NOT_FOUND", "message": "missing skill"}}

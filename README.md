@@ -1,288 +1,154 @@
-# YantrikDB for Hermes Dashboard
+# YantrikDB Dashboard
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/H2H1ZAPL)
+A standalone FastAPI dashboard for a separately running YantrikDB HTTP server. The dashboard has one data provider: HTTP. It does not open a local database, install or run another agent, or depend on an external gateway/service.
 
-A local-first web dashboard for browsing, visualising, and safely maintaining a YantrikDB memory store used by Hermes Agent.
+The application serves a static browser UI and proxies supported requests to YantrikDB. The YantrikDB bearer token remains in the server process. Supabase Auth protects the dashboard and API routes; mutating actions also require Admin Mode and the YantrikDB server's own write permissions.
 
-This is not meant to be a generic YantrikDB admin console. It is an operator dashboard for Hermes memory workflows: recall debugging, Identity & Scope checks, namespace coverage, contradiction review, memory browsing, entity/graph inspection, lifecycle signals, and read-only visualisation.
+## Requirements
 
-It is intentionally private/local: FastAPI backend, static HTML/CSS/JS frontend, no cloud calls from the dashboard backend, and read-only browsing by default. Mutating actions require Admin Mode, and optional password authentication can protect the dashboard when exposed beyond localhost.
+- Python 3.11 or newer
+- A reachable YantrikDB HTTP server (default: `http://127.0.0.1:7438`)
+- A Supabase project with Email sign-in enabled
 
-## Installation as a Hermes plugin
+The API mappings are checked against the YantrikDB server `v0.20.0` contract. If the server rejects a request, its status and JSON error envelope are passed through. A capability that does not exist in that HTTP contract returns an explicit `501` from the dashboard; it is not simulated with local state.
 
-Install directly from GitHub with the Hermes plugin command:
+## Install and run
 
 ```bash
-hermes plugins install wysie/yantrikdb-hermes-dashboard --enable
+git clone https://github.com/BVEnterprisess/yantrikdb-hermes-dashboard.git
+cd yantrikdb-hermes-dashboard
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+cp .env.example .env
+chmod 600 .env
 ```
 
-Then restart the running Hermes process so plugin metadata is rediscovered. For the gateway:
+Review `.env`, especially `YANTRIKDB_SERVER_URL`, `YANTRIKDB_TOKEN`, and the Supabase values, then start the dashboard:
 
 ```bash
-hermes gateway restart
-```
-
-Manual clone is also supported if you are developing the dashboard locally:
-
-```bash
-git clone https://github.com/wysie/yantrikdb-hermes-dashboard.git ~/.hermes/plugins/yantrikdb-hermes-dashboard
-hermes plugins enable yantrikdb-hermes-dashboard
-hermes gateway restart
-```
-
-If the directory already exists and you intentionally want to replace it, use:
-
-```bash
-hermes plugins install wysie/yantrikdb-hermes-dashboard --enable --force
-hermes gateway restart
-```
-
-`--force` deletes the existing plugin directory before reinstalling, so back up plugin-local changes first.
-
-## Starting the dashboard
-
-The plugin install gives Hermes the dashboard files. The dashboard itself is a local FastAPI web app.
-
-For a one-off local run:
-
-```bash
-cd ~/.hermes/plugins/yantrikdb-hermes-dashboard
 scripts/start.sh
 ```
 
-Then open:
-
-```text
-http://127.0.0.1:8767
-```
-
-By default the dashboard reads the Hermes YantrikDB SQLite store at:
-
-```text
-~/.hermes/yantrikdb-memory.db
-```
-
-Override paths or bind address when needed:
-
-```bash
-YANTRIKDB_DASHBOARD_HOST=127.0.0.1 \
-YANTRIKDB_DASHBOARD_PORT=8767 \
-YANTRIKDB_DB_PATH=~/.hermes/yantrikdb-memory.db \
-scripts/start.sh
-```
-
-## Optional: HTTP backend mode (talk to a yantrikdb-server cluster)
-
-The default mode reads the embedded-mode SQLite store at `YANTRIKDB_DB_PATH` directly — perfect for the single-instance Hermes plugin install. If you instead run `yantrikdb-server` on an HA cluster, set `YANTRIKDB_SERVER_URL` and the dashboard proxies supported routes to the cluster instead:
-
-```bash
-YANTRIKDB_SERVER_URL=http://your-cluster.local:7438 \
-YANTRIKDB_TOKEN=ydb_... \
-scripts/start.sh
-```
-
-Requires **yantrikdb-server v0.8.17 or later** for Phase 1 dashboard endpoints (`/v1/memories`, `/v1/memory/{rid}`, `/v1/stats`, `/v1/health`). Docker:
-
-```bash
-docker pull ghcr.io/yantrikos/yantrikdb:0.8.17
-```
-
-### What works in HTTP mode (Phase 1)
-
-| Dashboard route | Server endpoint |
-| --- | --- |
-| `GET /api/health` | `GET /v1/health` |
-| `GET /api/stats` | `GET /v1/stats` |
-| `GET /api/memories` (filters + pagination) | `GET /v1/memories` |
-| `GET /api/memory/{rid}` | `GET /v1/memory/{rid}` |
-
-That covers the overview, memory browser, and detail drawer.
-
-### What's deferred (Phase 2 + 3)
-
-Routes that need server endpoints not yet exposed over HTTP return **501** with a pointer to the tracking issue:
-
-- Recall debugger, conflicts review/resolve, think, forget — pending server-side endpoint additions
-- Identity & Scope page — `/v1/identity-scope` exists in v0.8.17 but the dashboard wiring is Phase 2
-- Visualiser, entity graph, lifecycle (stale/upcoming), patterns/triggers, JSONL export — pending `/v1/entities`, `/v1/graph/{entity}`, `/v1/sessions`, `/v1/stale`, `/v1/upcoming`, `/v1/patterns`, `/v1/triggers`, `/v1/export/memories.jsonl`
-
-Status of the engine-side endpoints lives at [yantrikos/yantrikdb-server#39](https://github.com/yantrikos/yantrikdb-server/issues/39).
-
-### Reverting to SQLite mode
-
-Unset `YANTRIKDB_SERVER_URL` and the dashboard reads SQLite again — no other config change needed.
-
-## Persistent macOS service
-
-For a dashboard that starts on login and restarts after crashes, install the LaunchAgent:
-
-```bash
-cd ~/.hermes/plugins/yantrikdb-hermes-dashboard
-YANTRIKDB_DASHBOARD_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python" \
-YANTRIKDB_DASHBOARD_HOST=127.0.0.1 \
-YANTRIKDB_DASHBOARD_PORT=8767 \
-scripts/install-launchd.sh
-```
-
-The installer writes:
-
-```text
-~/Library/LaunchAgents/io.yantrikdb.dashboard.local.plist
-```
-
-Uninstall:
-
-```bash
-cd ~/.hermes/plugins/yantrikdb-hermes-dashboard
-scripts/uninstall-launchd.sh
-```
-
-## Updating
-
-If you installed with the Hermes plugin command:
-
-```bash
-hermes plugins update yantrikdb-hermes-dashboard
-hermes gateway restart
-```
-
-If you want a clean reinstall from GitHub instead of pulling into the existing directory:
-
-```bash
-hermes plugins install wysie/yantrikdb-hermes-dashboard --enable --force
-hermes gateway restart
-```
-
-If you installed or develop the plugin as a manual git clone:
-
-```bash
-cd ~/.hermes/plugins/yantrikdb-hermes-dashboard
-git pull --ff-only
-hermes gateway restart
-```
-
-Use the `git pull` path when you want to keep a normal local checkout. Use the `hermes plugins install --force` path when you want Hermes to replace the plugin directory from the remote repo.
-
-## Screenshots
-
-The screenshots below are generated from a synthetic mock YantrikDB database. They do not contain private memory data.
-
-| Desktop | Mobile |
-| --- | --- |
-| ![Desktop overview](docs/screenshots/desktop-overview.png) | ![Mobile overview](docs/screenshots/mobile-overview.png) |
-| ![Desktop visualiser](docs/screenshots/desktop-visualiser.png) | ![Mobile visualiser](docs/screenshots/mobile-visualiser.png) |
-| ![Desktop memory browser](docs/screenshots/desktop-memories.png) | ![Mobile memory browser](docs/screenshots/mobile-memories.png) |
-| ![Desktop Identity & Scope](docs/screenshots/desktop-identity-scope.png) | ![Mobile Identity & Scope](docs/screenshots/mobile-identity-scope.png) |
-| ![Desktop settings](docs/screenshots/desktop-settings.png) | ![Mobile settings](docs/screenshots/mobile-settings.png) |
-
-Regenerate the gallery locally with:
-
-```bash
-python3 scripts/generate_mock_screenshots.py
-```
-
-The generator creates a temporary mock SQLite database, starts the dashboard on a random localhost port, captures desktop/mobile viewports, and writes the images to `docs/screenshots/`.
-
-## Features
-
-- Overview of active, consolidated, forgotten memories, conflicts, entities, edges, DB size, and embedder
-- Global namespace selector for browsing one Hermes memory scope or all scopes
-- Memory browser with search, status/domain/source filters, namespace chips, and detail drawer
-- Recall debugger with top-k, domain/source, consolidated-memory, and entity-expansion controls
-- Identity & Scope page for Hermes owner/person scoping, actor mapping, shared spaces, conversation routing, and namespace coverage
-- Contradiction review and resolution helpers
-- Entity graph inspection
-- Lifecycle and maintenance views for stale/upcoming memories, triggers, patterns, and safe housekeeping
-- Visualiser with Constellation and Neural Map modes backed by local YantrikDB data
-- JSONL export for active memories
-- Optional dashboard password managed from Settings
-
-## Safety model
-
-The dashboard can expose sensitive Hermes memory content to whoever can reach the web UI.
-
-Recommended default:
-
-```bash
-YANTRIKDB_DASHBOARD_HOST=127.0.0.1
-```
-
-Only bind to `0.0.0.0` if you intentionally want LAN access, and set a dashboard password from Settings first.
-
-There is no admin token to configure. Older admin-token style setup is obsolete. The current model is:
-
-1. Read-only browsing by default.
-2. Optional dashboard password for access control.
-3. Admin Mode for mutating operations such as maintenance, conflict resolution, and forgetting memories.
-
-Admin Mode can be toggled from Settings. For unattended local deployments, it can also be enabled at launch:
-
-```bash
-YANTRIKDB_DASHBOARD_ADMIN_MODE=true scripts/start.sh
-```
-
-Do not expose an Admin Mode dashboard without password protection.
+Open **http://127.0.0.1:8767**. The dashboard binds to `127.0.0.1:8767` by default. `scripts/start.sh` reads the shell-style `.env` file; keep it outside version control and restrict its permissions. The YantrikDB server must be started and managed separately.
 
 ## Configuration
 
 | Variable | Default | Purpose |
-|---|---:|---|
-| `YANTRIKDB_DASHBOARD_HOST` | `0.0.0.0` | Bind host for Uvicorn |
-| `YANTRIKDB_DASHBOARD_PORT` | `8767` | Bind port for Uvicorn |
-| `YANTRIKDB_DB_PATH` | `~/.hermes/yantrikdb-memory.db` | Hermes YantrikDB SQLite DB path |
-| `YANTRIKDB_NAMESPACE` | `hermes` | Base namespace used for defaults |
-| `YANTRIKDB_DASHBOARD_NAMESPACE` | `${YANTRIKDB_NAMESPACE}:hermes:default` | Default namespace selected in UI/API |
-| `YANTRIKDB_EMBEDDING_DIM` | inferred from DB | Override embedding dimension |
-| `YANTRIKDB_EMBEDDER` | dimension-based default | Override embedder name |
-| `YANTRIKDB_DASHBOARD_ADMIN_MODE` | `false` | Enables admin mutations at launch when truthy |
-| `YANTRIKDB_DASHBOARD_SETTINGS_PATH` | `~/.hermes/plugin-data/yantrikdb-hermes-dashboard/settings.json` | Persisted dashboard settings and password config |
-| `YANTRIKDB_DASHBOARD_PYTHON` | `python3` | Python binary used by `scripts/start.sh` and `scripts/install-launchd.sh` |
-| `YANTRIKDB_DASHBOARD_LOG_DIR` | `.run` | launchd stdout/stderr directory |
-| `YANTRIKDB_DASHBOARD_LAUNCHD_LABEL` | `io.yantrikdb.dashboard.local` | macOS LaunchAgent label |
+| --- | --- | --- |
+| `YANTRIKDB_SERVER_URL` | `http://127.0.0.1:7438` | YantrikDB HTTP API base URL; supports `http` or `https` |
+| `YANTRIKDB_TOKEN` | empty | Optional YantrikDB bearer token, read only by the FastAPI process |
+| `YANTRIKDB_DASHBOARD_HOST` | `127.0.0.1` | Dashboard bind address; use a trusted HTTPS reverse proxy for remote access |
+| `YANTRIKDB_DASHBOARD_PORT` | `8767` | Dashboard bind port |
+| `YANTRIKDB_DASHBOARD_NAMESPACE` | `default` | Initial memory-row namespace tag filter; it is not a tenant/database name |
+| `YANTRIKDB_DASHBOARD_ADMIN_MODE` | `false` | Enables supported writes at startup when truthy; the setting can also be changed in the dashboard |
+| `YANTRIKDB_DASHBOARD_SETTINGS_PATH` | `~/.config/yantrikdb-dashboard/settings.json` | Dashboard-local settings file, including Admin Mode and optional legacy password settings |
+| `YANTRIKDB_DASHBOARD_ENV_FILE` | `<repository>/.env` | Environment file read by `scripts/start.sh` |
+| `YANTRIKDB_DASHBOARD_PYTHON` | `python3` | Python executable used by the start and LaunchAgent scripts |
+| `YANTRIKDB_DASHBOARD_LAUNCHD_LABEL` | `io.yantrikdb.dashboard` | macOS LaunchAgent label |
+| `YANTRIKDB_DASHBOARD_LOG_DIR` | `<repository>/.run` | LaunchAgent stdout/stderr directory |
+| `SUPABASE_URL` | configured project URL | Supabase project URL |
+| `SUPABASE_PUBLISHABLE_KEY` | configured publishable key | Browser-safe Supabase key; never use a service-role or secret key |
+| `SUPABASE_AUTH_REDIRECT_URL` | dashboard origin plus `/login` | Optional canonical email-confirmation callback URL |
 
-## Frontend styling
+`YANTRIKDB_SERVER_URL` may not contain URL credentials, a query, or a fragment. Redirects from the configured YantrikDB host are rejected so the bearer token cannot be forwarded to an unexpected host.
 
-The dashboard uses a local Tailwind build, not the Tailwind CDN.
+### Supabase Auth
+
+The existing Supabase email/password sign-in flow is retained. FastAPI validates the Supabase access token server-side and sets an `HttpOnly`, `SameSite=Lax` cookie. Browser JavaScript receives only the Supabase publishable key; it never receives `YANTRIKDB_TOKEN`. The Auth bootstrap/session endpoints and static assets are public; the dashboard document and application API routes require a valid Supabase session.
+
+Configure the deployed dashboard's origin and `/login` callback in Supabase **Authentication → URL Configuration**. If the publishable key is missing while a Supabase URL is configured, protected routes remain fail-closed and the login page reports the incomplete setup. See [docs/supabase-auth.md](docs/supabase-auth.md) for the full setup and route behavior. Do not place a Supabase service-role key or secret key in `.env`, the browser, or the dashboard process.
+
+## Namespace and statistics semantics
+
+YantrikDB `v0.20.0` distinguishes the caller's visible tenant/database scopes from the `namespace` field attached to individual memory rows:
+
+- `GET /v1/identity-scope` returns a visible tenant/database inventory. In the current phase its `count` fields are `null` and identity-mapping arrays are empty. These values are displayed as returned, not inferred.
+- The dashboard's row-namespace selector filters memory records by their returned `namespace` tag. `All namespaces` omits that row-tag filter. Namespace labels are treated as opaque strings: values such as `all`, `*`, and an empty tag are passed as tags, not interpreted as aliases. The UI can also accept an arbitrary row tag; it does not assume a fixed product-specific namespace.
+- `GET /v1/stats` returns database-wide totals and takes no namespace query. The dashboard labels these totals as database-wide; it does not claim they are filtered by the selected row tag.
+
+## YantrikDB HTTP capabilities
+
+The dashboard currently maps these operations to the v0.20.0 HTTP API:
+
+| Dashboard operation | YantrikDB operation | Notes |
+| --- | --- | --- |
+| Process liveness | `GET /v1/health` | Dashboard's `/healthz` only reports local process liveness |
+| Statistics | `GET /v1/stats` | Database-wide, not row-namespace filtered |
+| Visible server scope | `GET /v1/identity-scope` | Read-only; counts may be `null` |
+| Memory list and detail | `GET /v1/memories`, `GET /v1/memory/{rid}` | Generic row namespace, domain, type, pagination, and supported sorts |
+| Recall | `POST /v1/recall` | Sends `skip_reinforce: true` so a diagnostic search does not mutate access counters |
+| Conflict list and resolution | `GET /v1/conflicts`, `POST /v1/conflicts/{id}/resolve` | The selected list record is shown directly; there is no separate conflict-detail GET route |
+| Forget and maintenance | `POST /v1/forget`, `POST /v1/think` | Dashboard Admin Mode plus server-side write permission required; think is server-wide |
+| Temporal reads | `GET /v1/temporal/stale`, `GET /v1/temporal/upcoming` | Accept row namespace, days, and limit |
+| Trigger actions | `GET /v1/triggers`, `GET /v1/triggers/history`, `POST /v1/triggers/{id}/{action}` | Trigger data/actions are node-local in the server contract |
+| Skill operations | `POST /v1/skills/search`, `GET /v1/skills/{skill_id}`, `POST /v1/skills/{skill_id}/outcome` | Outcome writes are supported; outcome-history reads are not |
+
+The JSONL export downloads memory pages from `/v1/memories`; it does not write a local database or export copy.
+
+### Contract limitations shown in the UI
+
+- `/v1/memories` supports the `active` status and `created_at`, `importance`, and `last_access` sort values. Its Phase 1 contract rejects non-active status filters, `q` text search, and `source` filters. Use Recall for server-side semantic search; the memory-list text box filters only the page already returned.
+- The overview composition breakdown and recent-write history are not exposed by `/v1/stats`; those panels show “not exposed” instead of fabricated values.
+- Identity-scope editing is read-only because the server has no `POST /v1/identity-scope` route.
+- The server exposes `GET /v1/claims` for a known entity, but not an all-entities index or a graph-edge read route. The Entity Graph view reports this; the Visualiser only groups returned records by explicit fields and only includes entity links present in returned metadata. It does not infer relationships from memory text.
+- Pattern mining results, recall-feedback history, low-usefulness candidates, recent client-side skill surfacing history, skill outcome-history reads, and a combined atomic hygiene write are not available through the current dashboard HTTP contract. The UI marks these capabilities unavailable rather than displaying invented results.
+- `POST /v1/think` is server-wide and has no row-namespace parameter. The dashboard requires **All namespaces** before running it.
+- Trigger actions and trigger history are node-local in the current server contract; use them with that operational scope in mind.
+
+## Persistent service
+
+### macOS LaunchAgent
+
+After creating the protected `.env` file, install the per-user LaunchAgent:
 
 ```bash
-cd ~/.hermes/plugins/yantrikdb-hermes-dashboard
-npm install
-npm run build:css
+YANTRIKDB_DASHBOARD_PYTHON="$PWD/.venv/bin/python" scripts/install-launchd.sh
 ```
 
-Source styles live in `src/styles.css`; the compiled artifact is served from `static/styles.css` so the FastAPI/launchd runtime stays a simple static app.
-
-## Development
+The installer uses the standalone dashboard label `io.yantrikdb.dashboard`, writes its plist under `~/Library/LaunchAgents`, and logs under `.run/` by default. Override the label, environment-file path, bind address, or log directory with the corresponding `YANTRIKDB_DASHBOARD_*` variables. To uninstall:
 
 ```bash
-python -m py_compile app.py
+scripts/uninstall-launchd.sh
+```
+
+### Linux systemd
+
+`deploy/yantrikdb-dashboard.service.example` is a hardened example unit. Adapt its install paths and create `/etc/yantrikdb-dashboard.env` with the required environment variables and protected file permissions before enabling it. The example expects an unprivileged `yantrikdb-dashboard` user and a virtual environment with this repository installed in editable mode.
+
+## Screenshots
+
+Public screenshots, when regenerated, use a local synthetic HTTP fixture server. The generator does not open a YantrikDB database, connect to a real service, or read private memory data. Install `requirements-dev.txt` and make Chrome/Chromium available (`CHROME_BIN` can point to its executable), then run:
+
+```bash
+python scripts/generate_mock_screenshots.py
+```
+
+The generator writes PNGs and a manifest under `docs/screenshots/`. The screenshot fixture bypasses Supabase Auth locally; it is not an authentication example and is not used by the dashboard runtime.
+
+## Development and tests
+
+```bash
+python -m py_compile app.py backend.py
 node --check static/app.js
-python -m pytest
+python -m pytest -q
+npm ci
 npm run build:css
 ```
 
-The tests avoid requiring a real YantrikDB database for basic smoke coverage.
+The test suite uses mocked HTTP responses and route fixtures; it does not require a live YantrikDB server or Supabase project. Tests cover the upstream wire contract, status/error passthrough, token redaction, Supabase session protections, generic namespaces, unsupported-capability responses, and the no-local-database-fallback guarantee.
 
-## Repository hygiene
+## Safety
 
-This repo intentionally excludes:
+- Keep `YANTRIKDB_DASHBOARD_HOST=127.0.0.1` unless a trusted HTTPS reverse proxy and network controls are in place.
+- Keep `.env` readable only by the dashboard operator; never commit it or include it in bug reports.
+- Use a YantrikDB token with only the permissions needed by the dashboard. The dashboard never displays or sends it to browser code.
+- Keep Admin Mode off unless you intentionally need supported write operations. Admin Mode does not override YantrikDB authorization or write-safety checks.
+- Do not expose an unauthenticated or write-enabled dashboard on a public network.
 
-- local SQLite databases
-- logs and process files
-- virtual environments
-- caches
-- private `.env` files
+## Credits and license
 
-Do not commit memory exports, live database snapshots, or screenshots containing private memory content.
+YantrikDB Dashboard is built by [wysie](https://github.com/wysie). [YantrikDB](https://github.com/yantrikos/yantrikdb-server) is created by [spranab](https://github.com/spranab).
 
-## Naming
-
-The dashboard UI and repository are named “YantrikDB for Hermes” / `yantrikdb-hermes-dashboard` to make the integration scope clear. The older `yantrikdb-dashboard` GitHub URL may redirect, but new installs should use `wysie/yantrikdb-hermes-dashboard`.
-
-## Credits
-
-Built by [wysie](https://github.com/wysie) for Hermes Agent memory operations. Thanks to [spranab](https://github.com/spranab) for creating [YantrikDB](https://github.com/yantrikos/y).
-
-## License
-
-MIT
+MIT License. See [LICENSE](LICENSE).

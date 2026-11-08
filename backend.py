@@ -1,66 +1,71 @@
-"""HTTP backend for cluster-mode deployments.
+"""Server-side HTTP adapter for the YantrikDB dashboard.
 
-The dashboard's default mode reads the embedded-mode SQLite store at
-``YANTRIKDB_DB_PATH`` directly. That works for single-instance Hermes
-plugin deployments but locks out anyone running yantrikdb-server on an
-HA cluster — there's no local SQLite file to read.
-
-Setting ``YANTRIKDB_SERVER_URL`` switches the dashboard to HTTP mode:
-every supported route proxies to the matching ``/v1/*`` endpoint on the
-cluster. Auth is the same Bearer-token scheme used by the plugin's
-``client.py``.
-
-Scope (matches yantrikdb-server v0.8.17 Phase 1 — issue #39):
-
-    /v1/health, /v1/stats, /v1/memories, /v1/memory/{rid}
-
-Routes that depend on engine endpoints not yet exposed over HTTP
-(entities, graph, lifecycle queries, export, recall, conflict ops,
-think, identity-scope writes) raise :class:`NotImplementedHTTPBackend`,
-which :mod:`app` turns into HTTP 501 with a "phase 2 pending" note.
-Those land as endpoints are added in subsequent server releases.
-
-The fallback path stays clean: when ``YANTRIKDB_SERVER_URL`` is unset
-the dashboard runs unchanged, reading SQLite directly.
+The dashboard is a client of a separately managed YantrikDB HTTP server. It
+never opens a local YantrikDB store and never sends the server token to the
+browser. The endpoint mappings here follow the YantrikDB server v0.20.0 HTTP
+surface; unsupported operations are reported by the FastAPI layer as explicit
+501 responses rather than being simulated locally.
 """
 from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import requests
 from fastapi import HTTPException
 
+DEFAULT_SERVER_URL = "http://127.0.0.1:7438"
 DEFAULT_TIMEOUT = (3.0, 15.0)  # (connect, read)
 
+# Internal dashboard sentinel for "All namespaces" in the UI. It never
+# represents a YantrikDB row tag; the HTTP layer omits it from requests.
+DASHBOARD_ALL_NAMESPACES = "__all__"
 
-class NotImplementedHTTPBackend(Exception):
-    """Raised when a route has no v0.8.17 HTTP equivalent yet.
 
-    ``app`` catches this and surfaces it as a 501 with a clear message
-    pointing the user at the server-side issue tracking the gap.
-    """
+class YantrikDBHTTPError(Exception):
+    """An upstream YantrikDB error whose status and JSON body must be kept."""
+
+    def __init__(self, status_code: int, payload: Any) -> None:
+        self.status_code = status_code
+        self.payload = payload
+        super().__init__(str(payload))
 
 
 class HTTPBackend:
-    """Thin proxy to a yantrikdb-server v0.8.17+ cluster.
+    """Proxy supported dashboard operations to one YantrikDB HTTP server."""
 
-    No retries, no circuit breaker, no response caching — dashboard
-    callers are interactive and see errors immediately. Keep this
-    simple; the plugin's ``client.py`` is the place for those features
-    when an agent loop needs them.
-    """
+    def __init__(self, base_url: str = DEFAULT_SERVER_URL, token: str = "") -> None:
+        candidate = (base_url or DEFAULT_SERVER_URL).strip().rstrip("/")
+        parsed = urlsplit(candidate)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("YANTRIKDB_SERVER_URL must be an http(s) URL without credentials, query, or fragment")
 
-    def __init__(self, base_url: str, token: str = "") -> None:
-        # Multiple URLs comma-separated → use the first (HA failover
-        # belongs in a load balancer in front of the cluster, not here).
-        self.base_url = base_url.split(",")[0].strip().rstrip("/")
-        self.token = token.strip()
+        self.base_url = candidate
+        self._token = token.strip()
         self._session = requests.Session()
-        if self.token:
-            self._session.headers["Authorization"] = f"Bearer {self.token}"
+        self._session.headers["Accept"] = "application/json"
+        if self._token:
+            self._session.headers["Authorization"] = f"Bearer {self._token}"
 
-    # ----- HTTP plumbing -----
+    def _redact(self, value: Any) -> Any:
+        """Defend against a misconfigured upstream echoing its Bearer token."""
+        if not self._token:
+            return value
+        if isinstance(value, str):
+            return value.replace(self._token, "[redacted]")
+        if isinstance(value, dict):
+            return {key: self._redact(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._redact(item) for item in value]
+        return value
 
     def _request(
         self,
@@ -72,97 +77,109 @@ class HTTPBackend:
     ) -> Any:
         url = f"{self.base_url}{path}"
         try:
-            resp = self._session.request(
+            # Do not follow redirects: a dashboard token must not be sent to
+            # an unexpected redirect target.
+            response = self._session.request(
                 method,
                 url,
                 params=params,
                 json=json,
                 timeout=DEFAULT_TIMEOUT,
+                allow_redirects=False,
             )
-        except requests.RequestException as e:
-            raise HTTPException(502, f"yantrikdb-server unreachable: {e}") from e
-        if resp.status_code == 404:
-            # Server route absent — most likely server is on a release
-            # older than v0.8.17. Surface that as a clear hint.
+        except requests.RequestException as exc:
+            message = str(exc)
+            if self._token:
+                message = message.replace(self._token, "[redacted]")
             raise HTTPException(
-                501,
-                f"server route {path} not found "
-                "(needs yantrikdb-server v0.8.17+ for Phase 1 dashboard endpoints; "
-                "see https://github.com/yantrikos/yantrikdb-server/issues/39)",
+                status_code=502,
+                detail=f"YantrikDB server at {self.base_url} is unreachable: {message}",
+            ) from exc
+
+        if 300 <= response.status_code < 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"YantrikDB server at {self.base_url} returned an unexpected redirect for {path}",
             )
-        if resp.status_code >= 400:
+
+        if response.status_code >= 400:
             try:
-                body = resp.json()
-                msg = body.get("error", {}).get("message") or body.get("detail") or resp.text
+                payload = response.json()
             except ValueError:
-                msg = resp.text
-            raise HTTPException(resp.status_code, f"yantrikdb-server: {msg}")
-        if resp.status_code == 204 or not resp.content:
+                payload = {"detail": response.text or response.reason_phrase}
+            raise YantrikDBHTTPError(response.status_code, self._redact(payload))
+
+        if response.status_code == 204 or not response.content:
             return {}
         try:
-            return resp.json()
-        except ValueError as e:
-            raise HTTPException(502, f"non-JSON response from {path}: {e}") from e
+            return self._redact(response.json())
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"YantrikDB server at {self.base_url} returned a non-JSON response for {path}",
+            ) from exc
 
-    # ----- Supported routes (v0.8.17 Phase 1) -----
+    @staticmethod
+    def _namespace_params(namespace: str | None) -> dict[str, str]:
+        if namespace is None:
+            return {}
+        if namespace == DASHBOARD_ALL_NAMESPACES:
+            # The dashboard's internal "All namespaces" sentinel; it is not a
+            # row tag and must not be sent to the server.
+            return {}
+        # Namespace tags are opaque user data: no other string value is
+        # reserved as an alias for the dashboard's All namespaces UI.
+        return {"namespace": str(namespace)}
 
-    def health(self, *, base_namespace: str = "", default_namespace: str = "") -> dict[str, Any]:
-        """Proxy /v1/health and adapt to the dashboard's /api/health shape.
-
-        The server returns cluster/raft info; the dashboard expects a
-        flatter shape with db_path/namespaces/version fields. We fill
-        the dashboard-shaped fields from what the server exposes and
-        leave SQLite-only fields (db_path, db_size_bytes, settings_path)
-        as HTTP-mode markers so the UI knows it's in cluster mode.
-
-        ``base_namespace`` / ``default_namespace`` come from the
-        dashboard's env config (YANTRIKDB_NAMESPACE,
-        YANTRIKDB_DASHBOARD_NAMESPACE). They're surfaced here so the
-        frontend can default the namespace selector to a real namespace
-        — sending ``__all__`` to the server's /v1/stats or /v1/memories
-        would 400 because the server has no dashboard magic value.
-        """
+    def health(self, *, default_namespace: str) -> dict[str, Any]:
+        """Proxy `/v1/health`, without inventing version or database details."""
         body = self._request("GET", "/v1/health")
-        cluster = body.get("cluster") or {}
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/health` returned an invalid JSON shape")
+        cluster = body.get("cluster") if isinstance(body.get("cluster"), dict) else {}
+        status = body.get("status", "unknown")
         return {
-            "ok": body.get("status") == "ok" or cluster.get("healthy") is True,
+            "ok": status == "ok" and cluster.get("healthy") is not False,
+            "status": status,
             "mode": "http",
             "server_url": self.base_url,
-            "db_path": None,
-            "db_exists": True,
-            "db_size_bytes": 0,
-            "yantrikdb_version": body.get("version") or "0.8.17+",
+            "default_namespace": default_namespace,
+            "namespaces": [],
             "cluster": cluster,
             "engines_loaded": body.get("engines_loaded"),
-            "base_namespace": base_namespace,
-            "default_namespace": default_namespace,
-            "namespaces": [],  # populated lazily by /api/stats per namespace
+            "capabilities": body.get("capabilities", []),
         }
 
-    def stats(self, namespace: str) -> dict[str, Any]:
-        """Proxy /v1/stats. Engine block is canonical; aggregations the
-        SQLite path computes locally (by_domain, by_source, by_type,
-        recent_by_day) come back empty in HTTP mode until the server
-        exposes those breakdowns. See issue #39 phase 2.
-        """
-        body = self._request("GET", "/v1/stats", params={"namespace": namespace})
+    def stats(self) -> dict[str, Any]:
+        """Proxy `/v1/stats`; the endpoint is database-wide, not tag-filtered."""
+        body = self._request("GET", "/v1/stats")
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/stats` returned an invalid JSON shape")
         return {
-            "namespace": namespace,
-            "memory_status": [],
-            "by_domain": [],
-            "by_source": [],
-            "by_type": [],
-            "recent_by_day": [],
-            "open_conflicts": body.get("open_conflicts") or 0,
-            "entities": body.get("entities") or 0,
-            "edges": body.get("edges") or 0,
+            "namespace": None,
+            "namespace_filter_supported": False,
+            "memory_status": None,
+            "by_domain": None,
+            "by_source": None,
+            "by_type": None,
+            "recent_by_day": None,
+            "open_conflicts": body.get("open_conflicts"),
+            "entities": body.get("entities"),
+            "edges": body.get("edges"),
             "engine": body,
         }
+
+    def identity_scope(self) -> dict[str, Any]:
+        """Proxy the server's read-only namespace/identity-scope inventory."""
+        body = self._request("GET", "/v1/identity-scope")
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/identity-scope` returned an invalid JSON shape")
+        return body
 
     def list_memories(
         self,
         *,
-        namespace: str,
+        namespace: str | None,
         status: str = "active",
         domain: str = "",
         source: str = "",
@@ -172,108 +189,196 @@ class HTTPBackend:
         offset: int = 0,
         sort: str = "created_at",
     ) -> dict[str, Any]:
-        """Proxy /v1/memories. The v0.8.17 endpoint rejects q/source/
-        certain sort variants with structured 400s — we forward those
-        unchanged so the UI can surface them.
-        """
+        """Proxy `/v1/memories` and pass server-side validation/errors through."""
         params: dict[str, Any] = {
-            "namespace": namespace,
             "status": status,
             "limit": limit,
             "offset": offset,
             "sort": sort,
         }
-        if domain:
-            params["domain"] = domain
-        if source:
-            params["source"] = source
-        if memory_type:
-            params["memory_type"] = memory_type
-        if q:
-            params["q"] = q
+        params.update(self._namespace_params(namespace))
+        for key, value in (
+            ("domain", domain),
+            ("source", source),
+            ("memory_type", memory_type),
+            ("q", q),
+        ):
+            if value:
+                params[key] = value
         body = self._request("GET", "/v1/memories", params=params)
-        return body  # server shape matches dashboard expectations
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/memories` returned an invalid JSON shape")
+        return body
 
-    def get_memory(self, rid: str, namespace: str) -> dict[str, Any]:
-        """Proxy /v1/memory/{rid} with explicit namespace.
+    def get_memory(self, rid: str, *, namespace: str | None = None) -> dict[str, Any]:
+        params = self._namespace_params(namespace)
+        body = self._request("GET", f"/v1/memory/{quote(rid, safe='')}", params=params)
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/memory/{rid}` returned an invalid JSON shape")
+        return body
 
-        Cluster-wide / admin tokens require a namespace param; pinned
-        tokens can only read their own. Without ``namespace`` the server
-        can 400/403 on cluster deployments. The dashboard always knows
-        which namespace it's browsing, so we forward it.
+    def recall(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        namespace: str | None,
+        domain: str | None,
+        source: str | None,
+        include_consolidated: bool,
+        expand_entities: bool,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "query": query,
+            "top_k": top_k,
+            "include_consolidated": include_consolidated,
+            "expand_entities": expand_entities,
+            # The dashboard is a diagnostic tool; this avoids changing
+            # last_access/access_count while previewing retrieval results.
+            "skip_reinforce": True,
+        }
+        payload.update(self._namespace_params(namespace))
+        if domain:
+            payload["domain"] = domain
+        if source:
+            payload["source"] = source
+        body = self._request("POST", "/v1/recall", json=payload)
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/recall` returned an invalid JSON shape")
+        return body
 
-        Phase 1 server may return null for updated_at / tombstone_reason
-        / embedding_model / embedding_bytes and empty arrays for
-        consolidation_sources / entities / claims — the UI handles those.
-        """
-        return self._request("GET", f"/v1/memory/{rid}", params={"namespace": namespace})
+    def conflicts(
+        self,
+        *,
+        namespace: str | None,
+        status: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        params.update(self._namespace_params(namespace))
+        if status:
+            params["status"] = status
+        body = self._request("GET", "/v1/conflicts", params=params)
+        if isinstance(body, list):
+            return {"items": body, "total": len(body)}
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/conflicts` returned an invalid JSON shape")
+        if "items" not in body and isinstance(body.get("conflicts"), list):
+            return {**body, "items": body["conflicts"]}
+        return body
 
-    # ----- Routes pending server endpoints (issue #39 Phase 2/3) -----
+    def resolve_conflict(self, conflict_id: str, *, payload: dict[str, Any]) -> dict[str, Any]:
+        body = self._request(
+            "POST",
+            f"/v1/conflicts/{quote(conflict_id, safe='')}/resolve",
+            json=payload,
+        )
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB conflict resolution returned an invalid JSON shape")
+        return body
 
-    def recall(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("recall")
+    def think(self, *, payload: dict[str, Any], namespace: str | None) -> dict[str, Any]:
+        if namespace is not None and namespace != DASHBOARD_ALL_NAMESPACES:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "Namespace-scoped maintenance is unavailable: YantrikDB `POST /v1/think` "
+                    "does not accept a namespace parameter. Select All namespaces to run the "
+                    "server-wide maintenance operation."
+                ),
+            )
+        body = self._request("POST", "/v1/think", json=payload)
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/think` returned an invalid JSON shape")
+        return body
 
-    def conflicts(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("conflicts")
+    def forget(self, rid: str, *, namespace: str | None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"rid": rid}
+        payload.update(self._namespace_params(namespace))
+        body = self._request("POST", "/v1/forget", json=payload)
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/forget` returned an invalid JSON shape")
+        return body
 
-    def identity_scope(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("identity-scope")
+    def temporal(self, kind: str, *, namespace: str | None, days: float, limit: int) -> dict[str, Any]:
+        if kind not in {"stale", "upcoming"}:
+            raise ValueError("kind must be stale or upcoming")
+        params: dict[str, Any] = {"days": days, "limit": limit}
+        params.update(self._namespace_params(namespace))
+        body = self._request("GET", f"/v1/temporal/{kind}", params=params)
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail=f"YantrikDB `/v1/temporal/{kind}` returned an invalid JSON shape")
+        items = body.get("memories")
+        if isinstance(items, list) and "items" not in body:
+            return {**body, "items": items}
+        return body
 
-    def entities(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("entities")
+    def triggers(self, *, limit: int = 50) -> dict[str, Any]:
+        body = self._request("GET", "/v1/triggers", params={"limit": limit})
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/triggers` returned an invalid JSON shape")
+        triggers = body.get("triggers")
+        if isinstance(triggers, list) and "items" not in body:
+            return {**body, "items": triggers}
+        return body
 
-    def graph(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("graph")
+    def trigger_history(self, *, limit: int = 50, trigger_type: str = "") -> dict[str, Any]:
+        """Proxy the server's node-local trigger history read route."""
+        params: dict[str, Any] = {"limit": limit}
+        if trigger_type:
+            params["trigger_type"] = trigger_type
+        body = self._request("GET", "/v1/triggers/history", params=params)
+        if isinstance(body, list):
+            return {"items": body, "count": len(body)}
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/triggers/history` returned an invalid JSON shape")
+        triggers = body.get("triggers")
+        if isinstance(triggers, list) and "items" not in body:
+            return {**body, "items": triggers}
+        return body
 
-    def sessions(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("sessions")
+    def trigger_action(self, trigger_id: str, action: str) -> dict[str, Any]:
+        if action not in {"acknowledge", "deliver", "act", "dismiss"}:
+            raise HTTPException(400, detail="action must be acknowledge, deliver, act, or dismiss")
+        body = self._request(
+            "POST",
+            f"/v1/triggers/{quote(trigger_id, safe='')}/{action}",
+            json={},
+        )
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB trigger action returned an invalid JSON shape")
+        return body
 
-    def stale(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("stale")
+    def skill_search(self, *, query: str, top_k: int, applies_to: str | None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"query": query, "top_k": top_k}
+        if applies_to:
+            # The server contract accepts an array, while the dashboard input
+            # is a single tag.
+            payload["applies_to"] = [applies_to]
+        body = self._request("POST", "/v1/skills/search", json=payload)
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/skills/search` returned an invalid JSON shape")
+        return body
 
-    def upcoming(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("upcoming")
+    def get_skill(self, skill_id: str) -> dict[str, Any]:
+        body = self._request("GET", f"/v1/skills/{quote(skill_id, safe='')}")
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB `/v1/skills/{skill_id}` returned an invalid JSON shape")
+        return body
 
-    def patterns(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("patterns")
-
-    def triggers(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("triggers")
-
-    def export_memories(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("export")
-
-    def constellation(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("constellation")
-
-    def think(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("think")
-
-    def forget(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedHTTPBackend("forget")
+    def record_skill_outcome(self, skill_id: str, *, success: bool, context: str = "") -> dict[str, Any]:
+        body = self._request(
+            "POST",
+            f"/v1/skills/{quote(skill_id, safe='')}/outcome",
+            json={"success": success, "context": context},
+        )
+        if not isinstance(body, dict):
+            raise HTTPException(502, detail="YantrikDB skill outcome write returned an invalid JSON shape")
+        return body
 
 
-def make_backend() -> HTTPBackend | None:
-    """Return an HTTPBackend if YANTRIKDB_SERVER_URL is set, else None.
-
-    None means "stay in SQLite mode" — the dashboard's existing route
-    handlers fall through to the original SQLite codepath.
-    """
-    url = os.environ.get("YANTRIKDB_SERVER_URL", "").strip()
-    if not url:
-        return None
+def make_backend() -> HTTPBackend:
+    """Build the required HTTP backend; blank/unset URL uses localhost:7438."""
+    url = os.environ.get("YANTRIKDB_SERVER_URL", DEFAULT_SERVER_URL).strip() or DEFAULT_SERVER_URL
     token = os.environ.get("YANTRIKDB_TOKEN", "")
     return HTTPBackend(url, token)
-
-
-def not_implemented_response(feature: str) -> HTTPException:
-    """Build the 501 envelope the dashboard returns for HTTP-mode routes
-    that need server endpoints from issue #39 Phase 2/3.
-    """
-    return HTTPException(
-        501,
-        f"'{feature}' not available in HTTP backend mode yet — "
-        "needs yantrikdb-server endpoint coverage from "
-        "https://github.com/yantrikos/yantrikdb-server/issues/39 "
-        "(Phase 2: entities + graph; Phase 3: lifecycle + analytics + export)",
-    )

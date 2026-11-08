@@ -5,16 +5,32 @@ import app as dashboard
 
 def test_supabase_auth_redirects_browser_and_rejects_api_without_session(monkeypatch):
     monkeypatch.setattr(dashboard, "SUPABASE_AUTH_ENABLED", True)
+    monkeypatch.setattr(dashboard, "SUPABASE_AUTH_CONFIGURED", True)
     client = TestClient(dashboard.app, follow_redirects=False)
 
     page = client.get("/")
     assert page.status_code == 303
     assert page.headers["location"] == "/login"
-    assert client.get("/api/health").status_code == 401
+    api_response = client.get("/api/health")
+    assert api_response.status_code == 401
+    assert api_response.headers["X-Dashboard-Auth"] == "required"
 
     config = client.get("/api/auth/config")
     assert config.status_code == 200
     assert config.json()["enabled"] is True
+
+
+def test_missing_publishable_key_fails_closed_when_supabase_url_is_set(monkeypatch):
+    monkeypatch.setattr(dashboard, "SUPABASE_AUTH_ENABLED", True)
+    monkeypatch.setattr(dashboard, "SUPABASE_AUTH_CONFIGURED", False)
+    monkeypatch.setattr(dashboard, "SUPABASE_PUBLISHABLE_KEY", "")
+    client = TestClient(dashboard.app, follow_redirects=False)
+
+    assert client.get("/").status_code == 303
+    assert client.get("/api/health").status_code == 401
+    config = client.get("/api/auth/config")
+    assert config.status_code == 200
+    assert config.json()["enabled"] is False
 
 
 def test_supabase_session_endpoint_sets_httponly_cookie_and_unlocks_routes(monkeypatch):

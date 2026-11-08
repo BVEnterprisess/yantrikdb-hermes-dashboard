@@ -1,0 +1,25 @@
+[Unit]
+Description=Standalone YantrikDB Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yantrikdb-dashboard
+Group=yantrikdb-dashboard
+StateDirectory=yantrikdb-dashboard
+StateDirectoryMode=0750
+WorkingDirectory=/opt/yantrikdb-dashboard
+EnvironmentFile=/etc/yantrikdb-dashboard.env
+Environment=YANTRIKDB_DASHBOARD_SETTINGS_PATH=/var/lib/yantrikdb-dashboard/settings.json
+ExecStart=/opt/yantrikdb-dashboard/.venv/bin/yantrikdb-dashboard
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/yantrikdb-dashboard
+
+[Install]
+WantedBy=multi-user.target

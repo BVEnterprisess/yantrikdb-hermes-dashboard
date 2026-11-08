@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LABEL="${YANTRIKDB_DASHBOARD_LAUNCHD_LABEL:-io.yantrikdb.dashboard.local}"
+LABEL="${YANTRIKDB_DASHBOARD_LAUNCHD_LABEL:-io.yantrikdb.dashboard}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true

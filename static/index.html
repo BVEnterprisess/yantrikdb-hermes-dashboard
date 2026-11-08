@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>YantrikDB for Hermes</title>
+  <title>YantrikDB Dashboard</title>
   <link rel="icon" href="/static/assets/favicon.svg?v=yantrikdb-white-favicon-2" type="image/svg+xml">
   <link rel="stylesheet" href="/static/styles.css?v=hide-city-tab-021" />
 </head>
@@ -15,7 +15,7 @@
         <span class="sigil"><img src="/static/assets/favicon.svg?v=yantrikdb-white-favicon-2" alt="" /></span>
         <span class="brand-copy">
           <span class="brand-title">YantrikDB</span>
-          <span class="brand-sub">for Hermes</span>
+          <span class="brand-sub">Dashboard</span>
         </span>
       </button>
       <button id="menuToggle" class="menu-toggle" aria-label="Open menu" aria-expanded="false">☰</button>
@@ -46,7 +46,7 @@
       <div>
         <h1 id="pageTitle">Memory Operations</h1>
         <div id="scopeBar" class="scope-bar" aria-live="polite">
-          <label class="scope-kicker" for="scopeSelect">Memory scope</label>
+          <label class="scope-kicker" for="scopeSelect">Row namespace</label>
           <select id="scopeSelect" aria-label="Memory scope"></select>
           <span id="scopeCount" class="scope-count"></span>
           <span id="scopeLoading" class="scope-loading hidden"><i></i>Loading…</span>
@@ -60,24 +60,26 @@
 
     <section id="view-overview" class="view active">
       <div class="grid stats" id="statsGrid"></div>
+      <p id="statsScopeNote" class="page-copy" aria-live="polite"></p>
       <div class="two-col overview-panels">
         <div class="panel">
-          <div class="panel-head"><h2>Memory composition</h2><span class="muted">domain/source/type</span></div>
+          <div class="panel-head"><h2>Memory composition</h2><span class="muted">summary fields exposed by server</span></div>
           <div id="composition"></div>
         </div>
         <div class="panel recent-panel">
-          <div class="panel-head"><h2>Recent writes</h2><span class="muted">last 30 days</span></div>
+          <div class="panel-head"><h2>Recent writes</h2><span class="muted">available from server</span></div>
           <canvas id="recentChart" height="190"></canvas>
           <div id="recentSummary" class="recent-summary" aria-label="Recent write summary"></div>
         </div>
       </div>
       <div class="panel">
-        <div class="panel-head"><h2>Namespaces & profile boundaries</h2><span class="muted">detect accidental sharing</span></div>
+        <div class="panel-head"><h2>Visible server scopes</h2><span class="muted">tenant / database inventory</span></div>
         <div id="namespaceTable" class="table-wrap"></div>
       </div>
     </section>
 
     <section id="view-visualiser" class="view">
+      <p class="page-copy">Domain and namespace links are derived from actual memory fields. Entity links are shown only when present in returned metadata; no entity relationships are inferred from text.</p>
       <div class="section-tabs visualiser-tabs" aria-label="Visualiser mode">
         <button id="threeConstellationTab" data-three-mode="constellation" class="active">Constellation</button>
         <button id="threeNeuralTab" data-three-mode="neural">Neural Map</button>
@@ -126,9 +128,9 @@
 
     <section id="view-memories" class="view">
       <div class="toolbar memory-toolbar">
-        <select id="memoryNamespaceFilter" aria-label="Memory namespace"></select>
-        <input id="memorySearch" placeholder="Search memories…" aria-label="Search memories" />
-        <select id="statusFilter" aria-label="Memory status"><option value="active">Active</option><option value="consolidated">Consolidated</option><option value="tombstoned">Forgotten</option><option value="all">All statuses</option></select>
+        <select id="memoryNamespaceFilter" aria-label="Memory row namespace"></select>
+        <input id="memorySearch" placeholder="Filter this page…" aria-label="Filter current memory page" />
+        <select id="statusFilter" aria-label="Memory status"><option value="active">Active memories</option></select>
         <div class="memory-filter-actions">
           <button id="memoryApply" class="btn secondary">Apply</button>
           <button id="memoryReset" class="btn ghost">Reset</button>
@@ -137,8 +139,8 @@
           <summary>More filters</summary>
           <div class="memory-advanced-grid">
             <input id="domainFilter" placeholder="Domain" aria-label="Domain" />
-            <input id="sourceFilter" placeholder="Source" aria-label="Source" />
-            <select id="sortFilter" aria-label="Sort memories"><option value="created_at">Newest first</option><option value="updated_at">Recently updated</option><option value="last_access">Recently accessed</option><option value="importance">Importance</option><option value="access_count">Access count</option></select>
+            <span class="muted">List endpoint does not support source or text filters; use Recall for semantic search.</span>
+            <select id="sortFilter" aria-label="Sort memories"><option value="created_at">Newest first</option><option value="last_access">Recently accessed</option><option value="importance">Importance</option></select>
           </div>
         </details>
       </div>
@@ -149,8 +151,8 @@
 
     <section id="view-recall" class="view">
       <div class="panel recall-panel">
-        <div class="panel-head"><h2>Recall</h2><span class="muted">Search without reinforcing memory</span></div>
-        <textarea id="recallQuery" placeholder="Ask: what should this agent remember about YantrikDB dashboards?"></textarea>
+        <div class="panel-head"><h2>Recall</h2><span class="muted">Search without reinforcing memory (skip_reinforce=true)</span></div>
+        <textarea id="recallQuery" placeholder="Search memories by meaning, namespace, domain, and source"></textarea>
         <div class="toolbar compact">
           <input id="recallDomain" placeholder="domain optional" />
           <input id="recallSource" placeholder="source optional" />
@@ -165,27 +167,21 @@
 
     <section id="view-skills" class="view">
       <div class="panel helper-card">
-        <div class="panel-head"><h2>Skill recall substrate</h2><span id="skillRecallStatus" class="muted">Checking YantrikDB skill recall…</span></div>
-        <p>DB-native procedural skills from YantrikDB: semantic search, auto-attach status, and outcome history. This is separate from regular file-based Hermes skills.</p>
+        <div class="panel-head"><h2>YantrikDB skills</h2><span id="skillRecallStatus" class="muted">HTTP capability status</span></div>
+        <p>Search and exact skill reads use the YantrikDB HTTP API. The server can record outcomes, but does not expose outcome-history reads or recent client-side surfacing history.</p>
         <div id="skillRecallCards" class="stats mini-stats"></div>
         <div id="skillRecallWarning" class="runtime-warning hidden"></div>
         <div class="toolbar compact">
-          <input id="skillSearchQuery" placeholder="Find procedural skill…" />
-          <input id="skillSearchAppliesTo" placeholder="tag filter, e.g. python" />
-          <input id="skillSearchTopK" type="number" min="1" max="20" value="5" />
+          <input id="skillSearchQuery" placeholder="Find a procedural skill…" />
+          <input id="skillSearchAppliesTo" placeholder="Optional applies-to tag" />
+          <input id="skillSearchTopK" type="number" min="1" max="50" value="5" aria-label="Maximum results" />
           <button id="runSkillSearch" class="btn primary">Search skills</button>
-          <button id="loadRecentSkills" class="btn secondary">Refresh recent</button>
         </div>
       </div>
       <div class="split">
         <div class="panel list-panel"><div id="skillSearchResults" class="memory-list"></div></div>
-        <div class="panel detail-panel"><div id="skillOutcomeDetail" class="empty">Search for a skill to inspect its body and outcome ledger.</div></div>
+        <div class="panel detail-panel"><div id="skillOutcomeDetail" class="empty">Search for a skill to inspect the server-returned record.</div></div>
       </div>
-      <div class="panel helper-card">
-        <div class="panel-head"><h2>Recently surfaced skills</h2><span id="recentSkillsStatus" class="muted">Recent auto-surface cache</span></div>
-        <p>Shows the last seven days of skills the provider surfaced for follow-up. Search above queries the DB-native skill substrate directly.</p>
-      </div>
-      <div id="recentSkillsList" class="memory-list"></div>
     </section>
 
     <section id="view-conflicts" class="view">
@@ -201,27 +197,18 @@
 
     <section id="view-graph" class="view">
       <div class="panel helper-card">
-        <div class="panel-head"><h2>How to use Entity Graph</h2><span class="muted">relationship edges only</span></div>
-        <p>Search picks an entity. Open graph draws YantrikDB relationship edges for that entity and lists memories explicitly linked to it. Plain text memories do not automatically appear here unless YantrikDB has populated entity/edge rows. If this page is empty, use Recall for normal memory search.</p>
+        <div class="panel-head"><h2>Entity graph</h2><span class="muted">Server read capability required</span></div>
+        <p>The YantrikDB HTTP API exposes <code>GET /v1/claims?entity=…</code>, but does not expose an all-entities index or a graph-edge read route. This dashboard does not synthesize graph edges. Use Recall or the metadata-based Visualiser until the server adds graph-read endpoints.</p>
+        <div id="entityList" class="memory-list compact-list"></div>
+        <div id="graphMeta" class="muted"></div>
       </div>
-      <div class="toolbar">
-        <input id="entitySearch" placeholder="Search entity…" />
-        <button id="loadEntities" class="btn secondary">Search</button>
-        <input id="graphEntity" placeholder="Entity graph root" />
-        <button id="loadGraph" class="btn primary">Open graph</button>
-      </div>
-      <div class="two-col wide-left">
-        <div class="panel"><div class="panel-head"><h2>Entity graph</h2><span id="graphMeta" class="muted"></span></div><svg id="graphSvg" viewBox="0 0 760 420"></svg></div>
-        <div class="panel"><div class="panel-head"><h2>Entities</h2><span class="muted">top mentions</span></div><div id="entityList" class="memory-list compact-list"></div></div>
-      </div>
-      <div class="panel"><div class="panel-head"><h2>Related memories</h2><span class="muted">entity evidence</span></div><div id="graphMemories" class="memory-list"></div></div>
     </section>
 
 
     <section id="view-lifecycle" class="view">
       <div class="grid stats" id="lifecycleCards"></div>
       <div class="two-col">
-      <div class="panel"><div class="panel-head"><h2>Stale memories</h2><span class="muted">Candidates for review</span></div><div id="staleList" class="memory-list"></div></div>
+      <div class="panel"><div class="panel-head"><h2>Stale memories</h2><span class="muted">From YantrikDB</span></div><div id="staleList" class="memory-list"></div></div>
       <div class="panel"><div class="panel-head"><h2>Upcoming reminders</h2><span class="muted">Time-based memories</span></div><div id="upcomingList" class="memory-list"></div></div>
       </div>
       <div class="two-col">
@@ -234,7 +221,7 @@
       <div class="maintenance-layout">
         <div class="panel maintenance-panel">
           <div class="panel-head"><h2>Maintenance</h2><span id="opsAdminState" class="pill neutral">Read-only</span></div>
-          <p class="page-copy">Run safe housekeeping for the selected memory scope. Keep Admin Mode off unless you are intentionally changing memory metadata.</p>
+          <p class="page-copy">Maintenance is a server-wide operation. Select All namespaces; the YantrikDB HTTP endpoint does not accept a namespace filter.</p>
           <div class="maintenance-scope">
             <span>Runs on</span>
             <strong id="opsScopeName">Current scope</strong>
@@ -250,15 +237,15 @@
           </div>
           <div class="action-row">
             <div>
-              <strong>v0.6 hygiene scan</strong>
-              <span>Review open contradictions and low-usefulness recall candidates before applying cleanup.</span>
+              <strong>Hygiene scan</strong>
+              <span>Review conflicts. Recall-feedback analysis is unavailable unless the server adds a history endpoint.</span>
             </div>
             <button id="runHygieneScan" class="btn secondary">Scan</button>
           </div>
           <div class="action-row secondary-row">
             <div>
               <strong>Health check</strong>
-              <span>Refresh dashboard configuration, database path, plugin state, and namespace counts.</span>
+              <span>Check the configured YantrikDB server health and exposed namespace inventory.</span>
             </div>
             <button id="refreshHealth" class="btn secondary">Refresh</button>
           </div>
@@ -276,81 +263,20 @@
     </section>
 
     <section id="view-identity-scope" class="view">
-      <div class="identity-hero panel">
-        <div>
-          <div class="label">Memory governance</div>
-          <h2>Identity &amp; Scope</h2>
-          <p class="page-copy">Create identities to group platform accounts under the right person. Use shared spaces for group chats or household/team memory.</p>
-          <div id="identityScopingStatus" class="scope-status-row" aria-label="Memory scoping status"></div>
-        </div>
+      <div class="panel helper-card">
+        <div class="panel-head"><h2>Namespace &amp; identity scope</h2><span class="muted">YantrikDB server inventory</span></div>
+        <p><code>GET /v1/identity-scope</code> lists visible tenant/database scopes. It does not enumerate memory-row namespace tags; the current v0.20.0 response leaves counts null and identity mappings empty. The memory namespace selector filters row tags from returned records (or accepts a custom tag), not tenant/database names. This view is read-only.</p>
         <div id="identityScopeSummary" class="identity-summary" aria-label="Identity and scope summary"></div>
       </div>
-      <div class="scope-grid">
-        <div class="panel scope-panel">
-          <div class="panel-head"><h2>People</h2><span class="muted">who the accounts belong to</span></div>
-          <form id="identityForm" class="scope-form" aria-label="Add identity">
-            <input id="identityId" placeholder="Short ID, e.g. yc" autocomplete="off" aria-label="Person short ID" />
-            <input id="identityLabel" placeholder="Display name, e.g. Yuan Chin" autocomplete="off" aria-label="Person display name" />
-            <input id="identityPrivateScope" placeholder="Advanced owner ID, auto-filled if blank" autocomplete="off" aria-label="Advanced owner ID" />
-            <button id="identitySubmit" class="btn secondary" type="submit">Save person</button>
-          </form>
-          <div id="identityList" class="scope-list"></div>
-        </div>
-        <div class="panel scope-panel">
-          <div class="panel-head"><h2>Actors</h2><span class="muted">platform accounts</span></div>
-          <p class="panel-note">Platform accounts mapped to people. Change the identity inline, then save that row.</p>
-          <div class="actor-filter-row">
-            <label for="actorIdentityFilter">Identity</label>
-            <select id="actorIdentityFilter" aria-label="Filter actors by identity"></select>
-          </div>
-          <div id="actorList" class="scope-list"></div>
-          <details class="details-block add-actor-details">
-            <summary>Add actor mapping manually</summary>
-            <form id="actorForm" class="scope-form subtle-form" aria-label="Map actor to identity">
-              <input id="actorPlatform" placeholder="Platform, e.g. whatsapp" autocomplete="off" aria-label="Actor platform" />
-              <input id="actorId" placeholder="Actor ID, e.g. 191...@lid" autocomplete="off" aria-label="Actor ID" />
-              <select id="actorIdentity" aria-label="Actor identity"></select>
-              <button class="btn secondary" type="submit">Add actor mapping</button>
-            </form>
-          </details>
-        </div>
-        <div class="panel scope-panel">
-          <div class="panel-head"><h2>Shared spaces</h2><span class="muted">group memory</span></div>
-          <form id="spaceForm" class="scope-form" aria-label="Add shared space">
-            <input id="spaceId" placeholder="Space ID, e.g. household" autocomplete="off" aria-label="Shared space ID" />
-            <input id="spaceLabel" placeholder="Label, e.g. Household" autocomplete="off" aria-label="Shared space label" />
-            <input id="spaceScope" placeholder="Advanced storage ID, auto-filled if blank" autocomplete="off" aria-label="Advanced shared-space storage ID" />
-            <div id="spaceMembersChecklist" class="checkbox-list" aria-label="Shared space members"></div>
-            <button class="btn secondary" type="submit">Add shared space</button>
-          </form>
-          <div id="spaceList" class="scope-list"></div>
-        </div>
-        <div class="panel scope-panel">
-          <div class="panel-head"><h2>Chat routing</h2><span class="muted">which chats use shared memory</span></div>
-          <form id="conversationForm" class="scope-form" aria-label="Route chat">
-            <select id="conversationPlatform" aria-label="Chat platform"></select>
-            <input id="conversationId" list="conversationIdOptions" placeholder="Chat ID" autocomplete="off" aria-label="Chat ID" />
-            <datalist id="conversationIdOptions"></datalist>
-            <select id="conversationScope" aria-label="Chat shared space"></select>
-            <button class="btn secondary" type="submit">Save chat route</button>
-          </form>
-          <div id="conversationList" class="scope-list"></div>
-        </div>
-      </div>
       <div class="panel">
-        <div class="panel-head"><h2>Namespace coverage</h2><span class="muted">who each memory bucket belongs to</span></div>
+        <div class="panel-head"><h2>Namespace inventory</h2><button id="reloadIdentityScope" class="btn secondary" type="button">Refresh</button></div>
         <div id="identityNamespaceTable" class="coverage-wrap"></div>
       </div>
       <div class="panel advanced-panel">
-        <div class="panel-head"><h2>Advanced config</h2><span class="muted">optional JSON</span></div>
-        <p class="page-copy">Use the page controls for normal edits. This JSON is only for bulk review or advanced fixes. Saving requires Admin Mode.</p>
+        <div class="panel-head"><h2>Server identity-scope response</h2><span class="muted">Read-only</span></div>
         <details class="details-block">
-          <summary>Show raw registry JSON</summary>
-          <textarea id="identityScopeJson" class="json-editor" spellcheck="false" aria-label="Identity and scope JSON"></textarea>
-          <div class="toolbar compact">
-            <button id="reloadIdentityScope" class="btn secondary" type="button">Reload</button>
-            <button id="saveIdentityScope" class="btn primary" type="button">Save registry</button>
-          </div>
+          <summary>Show raw response</summary>
+          <textarea id="identityScopeJson" class="json-editor" spellcheck="false" aria-label="YantrikDB identity-scope response" readonly></textarea>
         </details>
       </div>
     </section>
@@ -358,59 +284,33 @@
     <section id="view-settings" class="view">
       <div class="settings-layout">
         <div class="panel settings-panel">
-          <div class="panel-head"><h2>Settings</h2><span class="muted">Local controls</span></div>
+          <div class="panel-head"><h2>Settings</h2><span class="muted">Dashboard controls</span></div>
           <div class="setting-list">
-            <div class="setting-section-label">Memory scoping</div>
-            <label class="setting-row switch-row">
-              <span><strong>Save memories separately per person</strong><small>YC, Sheryl, and other people get their own memory buckets.</small><code class="config-name">owner_scoping</code></span>
-              <span class="switch-control-wrap"><input id="ownerScopingToggle" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></span>
-            </label>
-            <label class="setting-row switch-row">
-              <span><strong>Also search older shared memories</strong><small>Include the old shared memory bucket so older memories still show up after per-person scoping.</small><code class="config-name">include_base_namespace_recall</code></span>
-              <span class="switch-control-wrap"><input id="includeBaseRecallToggle" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></span>
-            </label>
-            <label class="setting-row switch-row">
-              <span><strong>Also search old platform-account memories</strong><small>Include memories saved under old WhatsApp/Telegram account buckets before they were grouped into people.</small><code class="config-name">include_legacy_actor_namespace_recall</code></span>
-              <span class="switch-control-wrap"><input id="includeActorRecallToggle" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></span>
-            </label>
-            <div class="setting-row compact-number-row">
-              <div><strong>Recall result count</strong><small>Default number of memories to retrieve for recall.</small><code class="config-name">top_k</code></div>
-              <input id="topKSetting" type="number" min="1" max="50" aria-label="Recall result count" />
-              <button id="saveMemoryScoping" class="btn primary" type="button">Save memory settings</button>
+            <div class="setting-section-label">YantrikDB connection</div>
+            <div class="setting-row">
+              <div><strong>Configured server</strong><small>Requests are proxied by this FastAPI process. The YantrikDB token is not sent to the browser.</small></div>
+              <span id="settingsServerUrl" class="pill">—</span>
             </div>
-            <div class="setting-section-label">v0.6 recall tuning & hygiene</div>
-            <label class="setting-row switch-row">
-              <span><strong>Self-tuning recall</strong><small>Allow explicit reinforcement feedback to boost memories that proved useful.</small><code class="config-name">self_tuning_recall</code></span>
-              <span class="switch-control-wrap"><input id="selfTuningRecallToggle" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></span>
-            </label>
-            <div class="setting-row compact-number-row">
-              <div><strong>Max reinforcement boost</strong><small>Cap for per-memory ranking lift from useful recall feedback.</small><code class="config-name">self_tuning_max_boost</code></div>
-              <input id="selfTuningMaxBoost" type="number" min="0" max="1" step="0.01" aria-label="Self-tuning max boost" />
-            </div>
-            <label class="setting-row switch-row">
-              <span><strong>Surface hygiene candidates</strong><small>Show low-usefulness recall candidates in the agent prompt for cleanup review.</small><code class="config-name">surface_hygiene</code></span>
-              <span class="switch-control-wrap"><input id="surfaceHygieneToggle" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></span>
-            </label>
-            <div class="setting-row compact-number-row">
-              <div><strong>Hygiene candidates shown</strong><small>Maximum low-usefulness candidates surfaced to the agent.</small><code class="config-name">hygiene_max_surfaced</code></div>
-              <input id="hygieneMaxSurfaced" type="number" min="1" max="50" aria-label="Hygiene candidates shown" />
+            <div class="setting-row">
+              <div><strong>Default namespace</strong><small>Initial row-tag filter used by the dashboard. Change it with YANTRIKDB_DASHBOARD_NAMESPACE.</small></div>
+              <span id="settingsNamespace" class="pill">—</span>
             </div>
             <div class="setting-section-label">Dashboard access</div>
             <label class="setting-row switch-row">
-              <span><strong>Admin Mode</strong><small>Allow memory-changing actions such as maintenance, conflict resolution, and forgetting memories.</small></span>
+              <span><strong>Admin Mode</strong><small>Allow supported memory-changing operations. YantrikDB still validates the server token and permissions.</small></span>
               <span class="switch-control-wrap"><input id="adminModeToggle" type="checkbox" /><span class="switch-control" aria-hidden="true"></span></span>
             </label>
             <div class="setting-row">
-              <div><strong>Authentication</strong><small>Supabase Auth protects the dashboard and API routes. Manage accounts and sign-in providers in Supabase Authentication.</small></div>
-              <span class="pill good">Supabase Auth</span>
+              <div><strong>Authentication</strong><small>Supabase Auth protects dashboard pages and all application API routes.</small></div>
+              <span id="settingsAuthState" class="pill">—</span>
             </div>
             <div class="setting-row export-row">
-              <div><strong>Export active memories</strong><small>Download the current memory scope for backup or inspection.</small></div>
+              <div><strong>Export active memories</strong><small>Download server-returned memory pages for the selected namespace.</small></div>
               <a id="settingsExportLink" class="btn secondary" href="#">Export <span class="btn-sub">JSONL</span></a>
             </div>
             <div class="setting-row session-row">
               <div><strong>Session</strong><small>End the current Supabase Auth session on this device.</small></div>
-              <button id="logoutBtn" class="btn secondary">Sign out</button>
+              <button id="logoutBtn" class="btn secondary" type="button">Sign out</button>
             </div>
           </div>
         </div>

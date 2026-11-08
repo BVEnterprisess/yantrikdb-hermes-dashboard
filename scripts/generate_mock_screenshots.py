@@ -1,37 +1,322 @@
 #!/usr/bin/env python3
-"""Generate mock-data screenshots for the README gallery.
+"""Generate public screenshots from synthetic HTTP fixtures (no database).
 
-This script intentionally builds a temporary synthetic YantrikDB SQLite database.
-It never reads the user's real YantrikDB memory store.
+The fixture server implements only dashboard HTTP responses needed by the
+screenshots. It does not start YantrikDB, open a local store, or read user data.
 """
-
 from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 import os
+import shutil
 import socket
-import sqlite3
 import subprocess
-import sys
+import threading
 import time
+import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 try:
     import websocket
 except ImportError as exc:  # pragma: no cover - optional local utility
-    raise SystemExit("websocket-client is required to generate screenshots") from exc
+    raise SystemExit("Install requirements-dev.txt to generate screenshots (websocket-client)") from exc
 
 ROOT = Path(__file__).resolve().parents[1]
+STATIC_DIR = ROOT / "static"
 OUT_DIR = ROOT / "docs" / "screenshots"
-TMP_DIR = Path("/tmp/yantrikdb-hermes-dashboard-screenshots")
-CHROME = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-DEFAULT_NS = "hermes:hermes:default"
-YC_NS = "hermes:hermes:default:owner:owner-yc-fba6a927a29b"
-TEAM_NS = "hermes:hermes:default:owner:group-household-8f7c2e4a1c09"
-OLD_NS = "hermes:hermes:default:owner:whatsapp-6590000000-7ca11f3b2d88"
+TMP_DIR = Path("/tmp/yantrikdb-dashboard-screenshots")
+CHROME = os.environ.get("CHROME_BIN") or shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+DEFAULT_NAMESPACE = "default"
+
+SAMPLES = [
+    ("dashboard", "A clear dashboard should distinguish server-reported facts from derived visual groupings.", ["Dashboard", "YantrikDB"]),
+    ("privacy", "The YantrikDB access token stays on the server and never enters browser storage.", ["YantrikDB", "Security"]),
+    ("operations", "Health checks should report an unavailable metric instead of displaying a fabricated zero.", ["Health", "Operations"]),
+    ("search", "Recall previews use skip_reinforce so a diagnostic query does not change access counters.", ["Recall", "YantrikDB"]),
+    ("namespace", "A namespace filter is a memory-row tag; tenant database names are a different scope.", ["Namespace", "Memory"]),
+    ("auth", "Supabase Auth validates the access token server-side and uses an HttpOnly session cookie.", ["Supabase", "Security"]),
+    ("maintenance", "Database-wide maintenance should require Admin Mode and an explicit confirmation.", ["Maintenance", "YantrikDB"]),
+    ("metadata", "Entity links are displayed only when the server returns explicit entity metadata.", ["Entities", "Visualiser"]),
+    ("lifecycle", "Temporal reminders and stale-memory candidates come directly from YantrikDB HTTP routes.", ["Lifecycle", "YantrikDB"]),
+    ("skills", "Skill search can read records and append outcomes; history reads are not exposed by this API.", ["Skills", "YantrikDB"]),
+    ("conflicts", "Conflict details shown in the dashboard come from the server list response.", ["Conflicts", "Operations"]),
+    ("export", "Exports contain only memory pages returned by the configured YantrikDB server.", ["Export", "Memory"]),
+]
+
+
+def memory_rows() -> list[dict[str, Any]]:
+    now = int(time.time())
+    namespaces = ["default", "personal", "team"]
+    rows: list[dict[str, Any]] = []
+    for index in range(48):
+        domain, text, entities = SAMPLES[index % len(SAMPLES)]
+        created = now - index * 3600
+        rows.append({
+            "rid": f"mock-{index + 1:03d}",
+            "type": "semantic" if index % 4 else "episodic",
+            "text": f"{text} Example {index + 1}: review the source and namespace before taking action.",
+            "created_at": created,
+            "created_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created)),
+            "updated_at": None,
+            "updated_at_iso": None,
+            "importance": round(.55 + (index % 8) * .05, 2),
+            "half_life": 604800,
+            "last_access": created + 240,
+            "access_count": index % 12,
+            "valence": 0,
+            "consolidated_into": None,
+            "consolidation_status": "active",
+            "storage_tier": "hot",
+            "metadata_json": {"screenshot_fixture": True, "entities": entities},
+            "namespace": namespaces[index % len(namespaces)],
+            "certainty": round(.72 + (index % 5) * .05, 2),
+            "domain": domain,
+            "source": ["user", "dashboard", "system"][index % 3],
+            "emotional_state": None,
+            "session_id": f"mock-session-{index % 5}",
+            "due_at": None,
+            "temporal_kind": None,
+            "tombstone_reason": None,
+            "embedding_model": None,
+            "embedding_bytes": None,
+        })
+    return rows
+
+
+MEMORIES = memory_rows()
+IDENTITY_SCOPE = {
+    "schema_version": 1,
+    "principal": {"kind": "token", "id": "screenshot-fixture", "is_admin": True},
+    "effective_scope": {"namespaces": ["default"], "owners": [], "permissions": ["memory:read"], "admin": True},
+    "identity_scope": {"identities": [], "actors": [], "spaces": [], "conversations": []},
+    "namespace_inventory": [{
+        "namespace": "default", "count": None, "mapped": False,
+        "mapped_scope": None, "mapped_to": None, "mapping_type": None,
+        "mapping_source": None, "derived_by_config": False,
+    }],
+    "summary": {"identities": 0, "actors": 0, "spaces": 0, "conversations": 0, "unmapped_namespaces": 1},
+}
+
+
+def filtered_memories(params: dict[str, list[str]]) -> list[dict[str, Any]]:
+    namespace = params.get("namespace", [DEFAULT_NAMESPACE])[0]
+    domain = params.get("domain", [""])[0]
+    rows = MEMORIES
+    if namespace not in {"", "__all__", "all", "*"}:
+        rows = [row for row in rows if row["namespace"] == namespace]
+    if domain:
+        rows = [row for row in rows if row["domain"] == domain]
+    sort = params.get("sort", ["created_at"])[0]
+    rows = sorted(rows, key=lambda row: row.get(sort) or 0, reverse=True)
+    return rows
+
+
+def constellation(params: dict[str, list[str]]) -> dict[str, Any]:
+    rows = filtered_memories(params)[:120]
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+    for row in rows:
+        memory_id = f"memory:{row['rid']}"
+        domain = row["domain"]
+        nodes[memory_id] = {
+            "id": memory_id, "memory_id": row["rid"], "label": row["text"][:56],
+            "kind": "memory", "category": domain, "weight": row["importance"],
+            "count": 1, "namespace": row["namespace"], "preview": row["text"][:200],
+        }
+        domain_id = f"domain:{domain}"
+        nodes.setdefault(domain_id, {"id": domain_id, "label": domain, "kind": "domain", "category": domain, "weight": 1, "count": 1})
+        edges.append({"id": f"derived:{row['rid']}", "source": memory_id, "target": domain_id, "kind": "derived_tag", "derived_from": "domain"})
+        for entity in row["metadata_json"]["entities"]:
+            entity_id = f"entity:{entity}"
+            nodes.setdefault(entity_id, {"id": entity_id, "label": entity, "kind": "entity", "category": "Entity", "weight": 1, "count": 1})
+            edges.append({"id": f"entity:{row['rid']}:{entity}", "source": memory_id, "target": entity_id, "kind": "explicit_metadata"})
+    return {
+        "read_only": True,
+        "all_namespaces": params.get("namespace", [DEFAULT_NAMESPACE])[0] in {"__all__", "all", "*", ""},
+        "nodes": list(nodes.values()), "edges": edges,
+        "clusters": [{"label": label, "count": sum(node.get("category") == label for node in nodes.values())} for label in sorted({node.get("category", "Other") for node in nodes.values()})],
+        "derivation_notice": "Synthetic screenshot fixture; links represent explicit fixture metadata or derived domain grouping.",
+    }
+
+
+def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+class FixtureHandler(BaseHTTPRequestHandler):
+    server_version = "YantrikDBDashboardScreenshotFixture/1.0"
+
+    def log_message(self, _format: str, *_args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+        if path == "/":
+            html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+            auth_tag = '<script type="module" src="/static/auth.js?v=supabase-auth-1"></script>'
+            shim = '<script>window.yantrikdbAuthReady=Promise.resolve();window.yantrikdbAuth={signOut:async()=>{}};</script>'
+            body = html.replace(auth_tag, shim).encode("utf-8")
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            return
+        if path == "/healthz":
+            json_response(self, 200, {"ok": True, "service": "yantrikdb-dashboard-screenshot-fixture"}); return
+        if path.startswith("/static/"):
+            relative = urllib.parse.unquote(path.removeprefix("/static/"))
+            file_path = (STATIC_DIR / relative).resolve()
+            if STATIC_DIR.resolve() not in file_path.parents or not file_path.is_file():
+                json_response(self, 404, {"detail": "static file not found"}); return
+            body = file_path.read_bytes(); content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+            self.send_response(200); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path == "/api/health":
+            json_response(self, 200, {"ok": True, "status": "ok", "mode": "http", "server_url": "http://127.0.0.1:7438", "default_namespace": DEFAULT_NAMESPACE, "namespaces": [], "cluster": {}, "engines_loaded": 1, "capabilities": ["screenshot-fixture"]}); return
+        if path == "/api/settings":
+            json_response(self, 200, {"admin_mode": True, "backend_mode": "http", "server_url": "http://127.0.0.1:7438", "default_namespace": DEFAULT_NAMESPACE, "supabase_auth_enabled": True, "supabase_auth_configured": True, "authenticated": True}); return
+        if path == "/api/identity-scope":
+            json_response(self, 200, {**IDENTITY_SCOPE, "default_namespace": DEFAULT_NAMESPACE, "read_only": True, "write_supported": False}); return
+        if path == "/api/stats":
+            stats = {"active_memories": len(MEMORIES), "consolidated_memories": 0, "tombstoned_memories": 0, "open_conflicts": 1, "entities": 4, "edges": 3}
+            json_response(self, 200, {"namespace": None, "namespace_filter_supported": False, "memory_status": None, "by_domain": None, "by_source": None, "by_type": None, "recent_by_day": None, "open_conflicts": 1, "entities": 4, "edges": 3, "engine": stats, "requested_namespace": params.get("namespace", [DEFAULT_NAMESPACE])[0]}); return
+        if path == "/api/memories":
+            rows = filtered_memories(params)
+            limit = min(200, int(params.get("limit", [50])[0])); offset = int(params.get("offset", [0])[0])
+            json_response(self, 200, {"items": rows[offset:offset + limit], "total": len(rows), "limit": limit, "offset": offset}); return
+        if path.startswith("/api/memory/"):
+            rid = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+            row = next((row for row in MEMORIES if row["rid"] == rid), None)
+            json_response(self, 200 if row else 404, row if row else {"detail": "not found"}); return
+        if path == "/api/constellation":
+            json_response(self, 200, constellation(params)); return
+        if path == "/api/conflicts":
+            json_response(self, 200, {"items": [{"conflict_id": "mock-conflict-001", "conflict_type": "preference", "priority": "medium", "status": "open", "entity": "Dashboard", "description": "Two synthetic display preferences need operator review.", "claim_a": {"rid": "mock-001", "text": "Use compact cards"}, "claim_b": {"rid": "mock-002", "text": "Use spacious cards"}}], "total": 1}); return
+        if path == "/api/stale":
+            json_response(self, 200, {"items": MEMORIES[3:7], "total": 4}); return
+        if path == "/api/upcoming":
+            json_response(self, 200, {"items": [], "total": 0}); return
+        if path == "/api/patterns":
+            json_response(self, 501, {"detail": "YantrikDB HTTP does not expose a patterns read route."}); return
+        if path == "/api/triggers":
+            json_response(self, 200, {"items": [], "total": 0}); return
+        if path == "/api/hygiene":
+            json_response(self, 200, {"namespace_filter_supported": False, "summary": {"active_memories": len(MEMORIES), "consolidated_memories": 0, "tombstoned_memories": 0, "open_conflicts": 1, "low_usefulness": None}, "open_conflicts": [], "low_usefulness_candidates": None, "feedback": {"available": False}}); return
+        if path == "/api/skill-recall/status":
+            json_response(self, 200, {"backend_mode": "http", "search_endpoint": "POST /v1/skills/search", "outcome_history_read_supported": False, "recent_surfacing_history_supported": False}); return
+        if path == "/api/skill-recall/search":
+            json_response(self, 200, {"items": [{"rid": "mock-skill-001", "skill_id": "review-http-contract", "skill_type": "procedural", "applies_to": ["python"], "score": 0.91, "body": "Verify every dashboard operation against the server HTTP contract."}], "total": 1}); return
+        if path.startswith("/api/skill-recall/"):
+            skill_id = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+            json_response(self, 200, {"skill_id": skill_id, "body": "Verify every dashboard operation against the server HTTP contract.", "applies_to": ["python"], "skill_type": "procedural"}); return
+        if path == "/api/recent-skills":
+            json_response(self, 501, {"detail": "Recent skill surfacing history is not exposed by YantrikDB HTTP."}); return
+        json_response(self, 404, {"detail": f"No screenshot fixture for {path}"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlsplit(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        try: payload = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError: payload = {}
+        if parsed.path == "/api/recall":
+            query = str(payload.get("query", "")).lower()
+            rows = [row for row in filtered_memories({"namespace": [str(payload.get("namespace", "__all__"))]}) if query in row["text"].lower()]
+            results = [{**row, "score": .91 - index * .04, "why_retrieved": ["semantic_similarity"]} for index, row in enumerate(rows[:10])]
+            json_response(self, 200, {"results": results, "fallback": None}); return
+        if parsed.path == "/api/settings":
+            json_response(self, 200, {"admin_mode": bool(payload.get("admin_mode")), "backend_mode": "http", "server_url": "http://127.0.0.1:7438", "default_namespace": DEFAULT_NAMESPACE, "supabase_auth_enabled": True, "supabase_auth_configured": True}); return
+        if parsed.path.endswith("/resolve"):
+            json_response(self, 200, {"ok": True, "status": "resolved", "strategy": payload.get("strategy")}); return
+        if parsed.path.startswith("/api/skill-recall/") and parsed.path.endswith("/outcome"):
+            json_response(self, 200, {"ok": True, "recorded": True}); return
+        if parsed.path == "/api/think":
+            json_response(self, 200, {"ok": True, "message": "Synthetic server-wide maintenance response"}); return
+        json_response(self, 501, {"detail": f"No screenshot fixture for {parsed.path}"})
+
+
+class ChromeSession:
+    def __init__(self, port: int, url: str, width: int, height: int, mobile: bool) -> None:
+        self.port, self.url, self.width, self.height, self.mobile = port, url, width, height, mobile
+        self.proc = None
+        self.ws = None
+        self.counter = 0
+        self.profile = TMP_DIR / f"chrome-profile-{port}"
+
+    def __enter__(self) -> "ChromeSession":
+        if not CHROME:
+            raise SystemExit("Chrome/Chromium not found; set CHROME_BIN to its executable path")
+        self.profile.mkdir(parents=True, exist_ok=True)
+        self.proc = subprocess.Popen([
+            CHROME, "--headless=new", "--no-sandbox", "--use-gl=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist",
+            "--no-first-run", "--no-default-browser-check", f"--user-data-dir={self.profile}",
+            f"--remote-debugging-port={self.port}", "--remote-allow-origins=*", f"--window-size={self.width},{self.height}", self.url,
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 20
+        tabs: list[dict[str, Any]] = []
+        while time.time() < deadline:
+            try:
+                tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=1))
+                if tabs: break
+            except Exception: time.sleep(.2)
+        tab = next((tab for tab in tabs if tab.get("type") == "page"), None)
+        if not tab: raise RuntimeError("Chrome did not expose a page target")
+        self.ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=15)
+        self.call("Page.enable"); self.call("Runtime.enable")
+        self.call("Emulation.setDeviceMetricsOverride", {"width": self.width, "height": self.height, "deviceScaleFactor": 2 if self.mobile else 1, "mobile": self.mobile})
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.ws: self.ws.close()
+        if self.proc:
+            self.proc.terminate()
+            try: self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired: self.proc.kill()
+
+    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.counter += 1
+        self.ws.send(json.dumps({"id": self.counter, "method": method, "params": params or {}}))
+        while True:
+            message = json.loads(self.ws.recv())
+            if message.get("id") == self.counter:
+                if "error" in message: raise RuntimeError(message["error"].get("message", method))
+                return message
+
+    def evaluate(self, expression: str) -> Any:
+        result = self.call("Runtime.evaluate", {"expression": expression, "awaitPromise": True, "returnByValue": True})
+        value = result.get("result", {}).get("result", {})
+        if value.get("subtype") == "error": raise RuntimeError(value.get("description", "browser evaluation failed"))
+        return value.get("value")
+
+    def prepare(self, view: str) -> dict[str, Any]:
+        self.call("Page.navigate", {"url": f"{self.url}?view={view}"})
+        self.evaluate("new Promise(resolve => { if (document.readyState === 'complete') resolve(true); else addEventListener('load', () => resolve(true), {once:true}); })")
+        result = self.evaluate(f"""(async()=>{{
+          for(let i=0;i<100 && typeof setView!=='function';i++) await new Promise(r=>setTimeout(r,100));
+          if(typeof setView!=='function') throw new Error('dashboard JS did not initialise');
+          await new Promise(r=>setTimeout(r,1200));
+          setView({json.dumps(view)},{{replace:true}});
+          if({json.dumps(view)}==='memories'){{ document.querySelector('#memorySearch').value='dashboard'; await loadMemories(); }}
+          if({json.dumps(view)}==='recall'){{ document.querySelector('#recallQuery').value='memory scope'; await runRecall(); }}
+          if({json.dumps(view)}==='visualiser') await new Promise(r=>setTimeout(r,2400));
+          if({json.dumps(view)}==='identity-scope') await loadIdentityScope();
+          if({json.dumps(view)}==='settings') await loadSettings();
+          await new Promise(r=>setTimeout(r,500)); window.scrollTo(0,0);
+          const doc=document.documentElement; return {{scrollWidth:doc.scrollWidth,clientWidth:doc.clientWidth,title:document.title}};
+        }})()""")
+        return result or {}
+
+    def screenshot(self, path: Path) -> None:
+        image = self.call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})["result"]["data"]
+        path.write_bytes(base64.b64decode(image))
 
 
 def free_port() -> int:
@@ -40,302 +325,38 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def make_mock_config(config_path: Path, identity_path: Path) -> None:
-    identity_path.write_text(json.dumps({
-        "owners": {
-            "owner:yc": {"actors": ["whatsapp:6590000000", "telegram:17847389"]},
-            "owner:household": {"actors": ["whatsapp:6591111111", "whatsapp:6592222222"]},
-        }
-    }, indent=2), encoding="utf-8")
-    config_path.write_text(json.dumps({
-        "mode": "embedded",
-        "namespace": "hermes",
-        "top_k": 10,
-        "owner_scoping": True,
-        "include_base_namespace_recall": True,
-        "include_legacy_actor_namespace_recall": True,
-        "identity_map_path": str(identity_path),
-    }, indent=2), encoding="utf-8")
-
-
-def make_mock_db(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path.unlink()
-    con = sqlite3.connect(path)
-    con.executescript("""
-    CREATE TABLE memories (
-        rid TEXT PRIMARY KEY,
-        type TEXT NOT NULL DEFAULT 'semantic',
-        text TEXT NOT NULL,
-        embedding BLOB,
-        created_at REAL NOT NULL,
-        updated_at REAL NOT NULL,
-        importance REAL NOT NULL DEFAULT 0.5,
-        half_life REAL NOT NULL DEFAULT 604800,
-        last_access REAL NOT NULL,
-        access_count INTEGER NOT NULL DEFAULT 0,
-        valence REAL NOT NULL DEFAULT 0,
-        consolidated_into TEXT,
-        consolidation_status TEXT DEFAULT 'active',
-        storage_tier TEXT NOT NULL DEFAULT 'hot',
-        metadata TEXT DEFAULT '{}',
-        namespace TEXT NOT NULL DEFAULT 'default',
-        certainty REAL NOT NULL DEFAULT 0.8,
-        domain TEXT NOT NULL DEFAULT 'general',
-        source TEXT NOT NULL DEFAULT 'user',
-        emotional_state TEXT,
-        session_id TEXT,
-        due_at REAL,
-        temporal_kind TEXT,
-        tombstone_reason TEXT,
-        created_at_unix_micros INTEGER NOT NULL DEFAULT 0,
-        embedding_model TEXT,
-        prior_rid TEXT,
-        resolution_kind TEXT,
-        dismissal_reason TEXT,
-        confidence_at_write REAL
-    );
-    CREATE VIRTUAL TABLE memories_fts USING fts5(text, content='memories', content_rowid='rowid');
-    CREATE TABLE conflicts (
-        conflict_id TEXT PRIMARY KEY, conflict_type TEXT NOT NULL, priority TEXT NOT NULL DEFAULT 'medium',
-        status TEXT NOT NULL DEFAULT 'open', memory_a TEXT NOT NULL, memory_b TEXT NOT NULL,
-        entity TEXT, rel_type TEXT, detected_at REAL NOT NULL, detected_by TEXT NOT NULL,
-        detection_reason TEXT NOT NULL, resolved_at REAL, resolved_by TEXT, strategy TEXT,
-        winner_rid TEXT, resolution_note TEXT, hlc BLOB NOT NULL, origin_actor TEXT NOT NULL
-    );
-    CREATE TABLE entities (name TEXT PRIMARY KEY, entity_type TEXT DEFAULT 'concept', first_seen REAL NOT NULL, last_seen REAL NOT NULL, mention_count INTEGER NOT NULL DEFAULT 1, metadata TEXT DEFAULT '{}');
-    CREATE TABLE memory_entities (memory_rid TEXT NOT NULL, entity_name TEXT NOT NULL, PRIMARY KEY(memory_rid, entity_name));
-    CREATE TABLE claims (
-        claim_id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL, rel_type TEXT NOT NULL,
-        weight REAL NOT NULL DEFAULT 1.0, created_at REAL NOT NULL, tombstoned INTEGER NOT NULL DEFAULT 0,
-        polarity INTEGER NOT NULL DEFAULT 1, modality TEXT NOT NULL DEFAULT 'asserted', valid_from REAL,
-        valid_to REAL, extractor TEXT NOT NULL DEFAULT 'mock', extractor_version TEXT, confidence_band TEXT NOT NULL DEFAULT 'high',
-        source_memory_rid TEXT, span_start INTEGER, span_end INTEGER, namespace TEXT NOT NULL DEFAULT 'default'
-    );
-    CREATE VIEW edges AS SELECT claim_id AS edge_id, src, dst, rel_type, weight, created_at, tombstoned,
-        polarity, modality, valid_from, valid_to, extractor, extractor_version, confidence_band,
-        source_memory_rid, span_start, span_end, namespace FROM claims;
-    CREATE INDEX idx_memories_namespace ON memories(namespace);
-    CREATE INDEX idx_memories_status ON memories(consolidation_status);
-    CREATE INDEX idx_memories_domain ON memories(domain);
-    CREATE INDEX idx_memories_source ON memories(source);
-    """)
-    now = time.time()
-    domains = ["memory", "dashboard", "privacy", "automation", "family", "business", "home", "health"]
-    snippets = [
-        "YantrikDB dashboard should keep memory scope visible, compact, and safe on mobile.",
-        "Identity & Scope explains which owner bucket each memory namespace belongs to.",
-        "Visualiser controls work best as compact mobile action grids, not vertical button towers.",
-        "Local-only WhatsApp memory content must stay on the private machine and never leave the LAN.",
-        "Dashboard settings should pair human labels with quiet raw config keys for operator trust.",
-        "Recall debugger should show why a memory was retrieved and which namespace it came from.",
-        "Namespace coverage cards avoid table overflow and keep status pills readable on phones.",
-        "Lifecycle review highlights stale memories, reminders, patterns, and maintenance actions.",
-        "Hermes plugin installs should use managed commands, with manual clone as a dev fallback.",
-        "Visualiser legends must match the actual runtime colours for entity, memory, and link nodes.",
-        "Public screenshots must use synthetic mock data, not private memory content.",
-        "Dashboard polish reserves red for destructive or critical states, not normal active memory.",
-    ]
-    rows = []
-    for i in range(96):
-        ns = [YC_NS, DEFAULT_NS, TEAM_NS, OLD_NS][i % 4]
-        domain = domains[i % len(domains)]
-        status = "consolidated" if i % 13 == 0 else ("tombstoned" if i % 29 == 0 else "active")
-        text = f"{snippets[i % len(snippets)]} Mock note {i+1}: {domain} operations use readable cards, source badges, and provenance."
-        rid = f"mock-{i+1:03d}"
-        created = now - i * 7200
-        rows.append((rid, "semantic" if i % 3 else "episodic", text, sqlite3.Binary(b"\x00" * 2048), created, created, 0.55 + (i % 9) * 0.045, 604800, created + 300, i % 17, 0, None, status, "hot", json.dumps({"mock": True, "topic": domain}), ns, 0.72 + (i % 5) * 0.045, domain, ["user", "system", "dashboard", "import"][i % 4], None, f"mock-session-{i%6}", None, None, None, int(created * 1_000_000), "potion-base-32M", None, None, None, None))
-    con.executemany("""
-        INSERT INTO memories(rid,type,text,embedding,created_at,updated_at,importance,half_life,last_access,access_count,valence,
-        consolidated_into,consolidation_status,storage_tier,metadata,namespace,certainty,domain,source,emotional_state,session_id,
-        due_at,temporal_kind,tombstone_reason,created_at_unix_micros,embedding_model,prior_rid,resolution_kind,dismissal_reason,confidence_at_write)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, rows)
-    con.execute("INSERT INTO memories_fts(rowid, text) SELECT rowid, text FROM memories")
-    entities = [("YantrikDB", "system"), ("Hermes", "agent"), ("Memory Scope", "concept"), ("Identity Map", "config"), ("Visualiser", "feature"), ("Dashboard", "product")]
-    for name, typ in entities:
-        con.execute("INSERT INTO entities VALUES (?,?,?,?,?,?)", (name, typ, now-90000, now, 18, json.dumps({"mock": True})))
-    for idx, rid in enumerate([r[0] for r in rows[:36]]):
-        for ent in [entities[idx % len(entities)][0], entities[(idx+2) % len(entities)][0]]:
-            con.execute("INSERT OR IGNORE INTO memory_entities VALUES (?,?)", (rid, ent))
-    claims = [("YantrikDB", "powers", "Hermes"), ("Memory Scope", "protects", "Dashboard"), ("Identity Map", "routes", "Memory Scope"), ("Visualiser", "summarises", "YantrikDB"), ("Dashboard", "inspects", "Hermes")]
-    for i, (src, rel, dst) in enumerate(claims):
-        con.execute("INSERT INTO claims(claim_id,src,dst,rel_type,weight,created_at,source_memory_rid,namespace) VALUES (?,?,?,?,?,?,?,?)", (f"claim-{i+1}", src, dst, rel, 0.82, now-i*5000, f"mock-{i+1:03d}", DEFAULT_NS))
-    con.execute("INSERT INTO conflicts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("conflict-001", "preference", "high", "open", "mock-001", "mock-002", "Dashboard", "prefers", now-8000, "mock", "Two UI density preferences need review", None, None, None, None, None, b"mock", "mock"))
-    con.commit()
-    con.close()
-
-
-class ChromeSession:
-    def __init__(self, port: int, url: str, width: int, height: int, mobile: bool) -> None:
-        self.port, self.url, self.width, self.height, self.mobile = port, url, width, height, mobile
-        self.proc: subprocess.Popen[bytes] | None = None
-        self.ws: websocket.WebSocket | None = None
-        self.counter = 0
-        self.profile = TMP_DIR / f"chrome-profile-{port}"
-
-    def __enter__(self) -> "ChromeSession":
-        if not CHROME.exists():
-            raise SystemExit(f"Chrome not found at {CHROME}")
-        self.profile.mkdir(parents=True, exist_ok=True)
-        self.proc = subprocess.Popen([
-            str(CHROME), "--headless=new", "--use-gl=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist",
-            "--no-first-run", "--no-default-browser-check",
-            f"--user-data-dir={self.profile}", f"--remote-debugging-port={self.port}", "--remote-allow-origins=*",
-            f"--window-size={self.width},{self.height}", self.url,
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.time() + 20
-        tabs: list[dict[str, Any]] = []
-        while time.time() < deadline:
-            try:
-                tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=1))
-                if tabs:
-                    break
-            except Exception:
-                time.sleep(0.2)
-        tab = next(tab for tab in tabs if tab.get("type") == "page")
-        self.ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=10)
-        self.call("Page.enable")
-        self.call("Runtime.enable")
-        self.call("Emulation.setDeviceMetricsOverride", {"width": self.width, "height": self.height, "deviceScaleFactor": 2 if self.mobile else 1, "mobile": self.mobile})
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        if self.ws:
-            self.ws.close()
-        if self.proc:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-
-    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        if self.ws is None:
-            raise RuntimeError("Chrome session not started")
-        self.counter += 1
-        self.ws.send(json.dumps({"id": self.counter, "method": method, "params": params or {}}))
-        while True:
-            msg = json.loads(self.ws.recv())
-            if msg.get("id") == self.counter:
-                return msg
-
-    def prepare(self, view: str) -> dict[str, Any]:
-        self.call("Page.navigate", {"url": f"{self.url}?view={view}"})
-        self.call("Page.loadEventFired")
-        expr = f"""
-        (async()=>{{
-          for (let i=0; i<120 && typeof setView !== 'function'; i++) await new Promise(r=>setTimeout(r,100));
-          if (typeof setView !== 'function') throw new Error('dashboard JS did not initialise');
-          setView({json.dumps(view)}, {{replace:true}});
-          await new Promise(r=>setTimeout(r,1200));
-          if ({json.dumps(view)} === 'memories') {{
-            document.querySelector('#memorySearch').value = 'dashboard';
-            document.querySelector('#statusFilter').value = 'all';
-            await loadMemories();
-          }}
-          if ({json.dumps(view)} === 'recall') {{
-            document.querySelector('#recallQuery').value = 'Why keep memory scope visible?';
-            await runRecall();
-          }}
-          if ({json.dumps(view)} === 'graph') {{
-            document.querySelector('#graphEntity').value = 'YantrikDB';
-            await loadGraph('YantrikDB');
-          }}
-          if ({json.dumps(view)} === 'visualiser') {{
-            await loadVisualiser(true);
-            await new Promise(r=>setTimeout(r,2200));
-          }}
-          if ({json.dumps(view)} === 'identity-scope') {{
-            await loadIdentityScope();
-          }}
-          if ({json.dumps(view)} === 'settings') {{
-            await loadSettings();
-          }}
-          await new Promise(r=>setTimeout(r,500));
-          window.scrollTo(0,0);
-          const doc = document.documentElement;
-          return {{scrollWidth: doc.scrollWidth, clientWidth: doc.clientWidth, title: document.title}};
-        }})()
-        """
-        res = self.call("Runtime.evaluate", {"expression": expr, "awaitPromise": True, "returnByValue": True})
-        result = res.get("result", {}).get("result", {})
-        if result.get("subtype") == "error":
-            raise RuntimeError(result.get("description") or result.get("value") or "browser evaluation failed")
-        return result.get("value", {})
-
-    def screenshot(self, path: Path) -> None:
-        data = self.call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})["result"]["data"]
-        path.write_bytes(base64.b64decode(data))
-
-
-def wait_for_server(url: str) -> None:
-    deadline = time.time() + 25
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=1) as resp:
-                if resp.status == 200:
-                    return
-        except Exception:
-            time.sleep(0.2)
-    raise RuntimeError(f"Server did not become ready: {url}")
-
-
 def run() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
-    db_path = TMP_DIR / "mock-yantrikdb.db"
-    settings_path = TMP_DIR / "settings.json"
-    config_path = TMP_DIR / "yantrikdb.json"
-    identity_path = TMP_DIR / "identity-map.json"
-    make_mock_db(db_path)
-    make_mock_config(config_path, identity_path)
-    if settings_path.exists():
-        settings_path.unlink()
     port = free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), FixtureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
     base_url = f"http://127.0.0.1:{port}/"
-    env = {
-        **os.environ,
-        "YANTRIKDB_DB_PATH": str(db_path),
-        "YANTRIKDB_DASHBOARD_HOST": "127.0.0.1",
-        "YANTRIKDB_DASHBOARD_PORT": str(port),
-        "YANTRIKDB_DASHBOARD_SETTINGS_PATH": str(settings_path),
-        "YANTRIKDB_CONFIG_PATH": str(config_path),
-        "HERMES_WHATSAPP_SESSION_DIR": str(TMP_DIR / "whatsapp-session"),
-        "YANTRIKDB_EMBEDDER": "potion-base-32M",
-        "YANTRIKDB_EMBEDDING_DIM": "512",
-    }
-    server = subprocess.Popen([sys.executable, str(ROOT / "app.py")], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    shots = [
+        ("desktop-overview.png", 1440, 1000, False, "overview"),
+        ("desktop-visualiser.png", 1440, 1000, False, "visualiser"),
+        ("desktop-memories.png", 1440, 1000, False, "memories"),
+        ("desktop-identity-scope.png", 1440, 1000, False, "identity-scope"),
+        ("desktop-settings.png", 1440, 1000, False, "settings"),
+        ("mobile-overview.png", 390, 844, True, "overview"),
+        ("mobile-memories.png", 390, 844, True, "memories"),
+        ("mobile-settings.png", 390, 844, True, "settings"),
+    ]
     try:
-        wait_for_server(f"{base_url}api/health")
-        shots = [
-            ("desktop-overview.png", 1440, 1000, False, "overview"),
-            ("desktop-visualiser.png", 1440, 1000, False, "visualiser"),
-            ("desktop-memories.png", 1440, 1000, False, "memories"),
-            ("desktop-identity-scope.png", 1440, 1000, False, "identity-scope"),
-            ("desktop-settings.png", 1440, 1000, False, "settings"),
-            ("mobile-overview.png", 390, 844, True, "overview"),
-            ("mobile-visualiser.png", 390, 844, True, "visualiser"),
-            ("mobile-identity-scope.png", 390, 844, True, "identity-scope"),
-            ("mobile-memories.png", 390, 844, True, "memories"),
-            ("mobile-settings.png", 390, 844, True, "settings"),
-        ]
         manifest: list[dict[str, Any]] = []
-        for idx, (name, width, height, mobile, view) in enumerate(shots):
-            with ChromeSession(9530 + idx, base_url, width, height, mobile) as chrome:
+        for index, (name, width, height, mobile, view) in enumerate(shots):
+            with ChromeSession(9530 + index, base_url, width, height, mobile) as chrome:
                 metrics = chrome.prepare(view)
-                out = OUT_DIR / name
-                chrome.screenshot(out)
+                output = OUT_DIR / name
+                chrome.screenshot(output)
                 manifest.append({"file": name, "view": view, "viewport": f"{width}x{height}", **metrics})
-                print(f"wrote {out.relative_to(ROOT)}")
+                print(f"wrote {output.relative_to(ROOT)}")
         (OUT_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     finally:
-        server.terminate()
-        try:
-            server.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server.kill()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 if __name__ == "__main__":
