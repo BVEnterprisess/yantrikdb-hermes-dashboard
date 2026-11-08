@@ -52,6 +52,8 @@ def test_infer_embedding_dim_from_sqlite_blob(tmp_path, monkeypatch):
 def test_static_assets_exist():
     assert (Path(dashboard.STATIC_DIR) / "index.html").exists()
     assert (Path(dashboard.STATIC_DIR) / "app.js").exists()
+    assert (Path(dashboard.STATIC_DIR) / "auth.js").exists()
+    assert (Path(dashboard.STATIC_DIR) / "login.html").exists()
     assert (Path(dashboard.STATIC_DIR) / "styles.css").exists()
     assert (Path(dashboard.STATIC_DIR) / "assets" / "favicon.svg").exists()
 
