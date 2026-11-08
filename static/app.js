@@ -1,8 +1,9 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
-const state = { health:null, stats:null, settings:null, defaultNamespace:'', selectedNamespace:'__all__', view:'overview', memoryOffset:0, selectedMemory:null, recentWrites:[], identityScope:null, actorIdentityFilter:'__all__' };
+const state = { health:null, stats:null, settings:null, defaultNamespace:'default', selectedNamespace:'__all__', namespaceTags:[], initialized:false, view:'overview', memoryOffset:0, selectedMemory:null, recentWrites:null, identityScope:null, actorIdentityFilter:'__all__' };
 const VALID_VIEWS = new Set(['overview','visualiser','memories','recall','skills','conflicts','graph','identity-scope','lifecycle','ops','settings']);
 const ALL_NAMESPACES = '__all__';
+const CUSTOM_NAMESPACE = '__custom__';
 const DEFAULT_VIZ_CAMERA = { rotation:.55, tilt:.78, zoom:1, panX:0, panY:0 };
 const viz = { frame:0, nodes:[], edges:[], byId:{}, stars:[], data:null, mode:'constellation', paused:false, interaction:'rotate', drag:null, lastFrameTime:0, ...DEFAULT_VIZ_CAMERA };
 
@@ -35,35 +36,47 @@ async function api(path, opts={}){
   const res = await fetch(path, {...opts, headers, credentials:'same-origin'});
   const txt = await res.text();
   let data; try{ data=txt?JSON.parse(txt):{} }catch{ data={raw:txt}; }
-  if(res.status===401){ showLogin(); throw new Error(data.detail || 'Authentication required'); }
-  if(!res.ok) throw new Error(data.detail || data.error || res.statusText);
-  if(data && (data.ok===false || data.status==='failed')) throw new Error(data.reason || data.error || `${data.tool||'YantrikDB'} failed`);
+  const message=value=>typeof value==='string'?value:JSON.stringify(value);
+  if(res.status===401 && res.headers.get('X-Dashboard-Auth')==='required'){
+    showLogin(); throw new Error(message(data.detail || 'Authentication required'));
+  }
+  if(!res.ok) throw new Error(message(data.detail ?? data.error ?? res.statusText));
+  if(data && (data.ok===false || data.status==='failed')) throw new Error(message(data.reason || data.error || `${data.tool||'YantrikDB'} failed`));
   return data;
 }
-function ns(){ return state.selectedNamespace || ALL_NAMESPACES; }
-function setNamespace(value){ const v=value || ALL_NAMESPACES; state.selectedNamespace=v; if($('#scopeSelect')) $('#scopeSelect').value=v; if($('#memoryNamespaceFilter')) $('#memoryNamespaceFilter').value=v; }
+function ns(){ return state.selectedNamespace ?? ALL_NAMESPACES; }
+function setNamespace(value){ const v=value===null||value===undefined?ALL_NAMESPACES:value; state.selectedNamespace=v; if($('#scopeSelect')) $('#scopeSelect').value=v; if($('#memoryNamespaceFilter')) $('#memoryNamespaceFilter').value=v; }
+function namespaceOptions(selected){
+  const values=[...new Set([state.defaultNamespace,...(state.namespaceTags||[]),selected].filter(value=>value!==null&&value!==undefined&&value!==ALL_NAMESPACES&&value!==CUSTOM_NAMESPACE))].sort((a,b)=>String(a).localeCompare(String(b)));
+  return `<option value="${ALL_NAMESPACES}">All namespaces</option>`+values.map(value=>`<option value="${esc(value)}">${value===''?'(empty namespace)':esc(value)}${value===state.defaultNamespace?' (default)':''}</option>`).join('')+`<option value="${CUSTOM_NAMESPACE}">Enter a namespace…</option>`;
+}
+function chooseNamespace(value){
+  if(value!==CUSTOM_NAMESPACE){ setNamespace(value); return; }
+  const valueFromUser=window.prompt('Enter a YantrikDB memory-row namespace. This is a row tag, not a tenant/database name:');
+  if(valueFromUser&&valueFromUser.trim()){ setNamespace(valueFromUser.trim()); }
+  else { if($('#scopeSelect')) $('#scopeSelect').value=ns(); if($('#memoryNamespaceFilter')) $('#memoryNamespaceFilter').value=ns(); }
+}
 function syncMemoryFiltersFromUrl(params=new URLSearchParams(location.search)){
   if(params.has('q')) $('#memorySearch').value=params.get('q')||'';
   if(params.has('status')) $('#statusFilter').value=params.get('status')||'active';
   if(params.has('domain')) $('#domainFilter').value=params.get('domain')||'';
-  if(params.has('source')) $('#sourceFilter').value=params.get('source')||'';
   if(params.has('sort')) $('#sortFilter').value=params.get('sort')||'created_at';
-  if(params.has('namespace')) setNamespace(params.get('namespace') || ALL_NAMESPACES);
+  if(params.has('namespace')) setNamespace(params.get('namespace'));
   updateMemoryAdvancedFilters();
 }
 function updateMemoryAdvancedFilters(){
   const details = $('#memoryAdvancedFilters');
   if(!details) return;
-  const hasAdvanced = !!($('#domainFilter')?.value || $('#sourceFilter')?.value || (($('#sortFilter')?.value || 'created_at') !== 'created_at'));
+  const hasAdvanced = !!($('#domainFilter')?.value || (($('#sortFilter')?.value || 'created_at') !== 'created_at'));
   details.open = hasAdvanced;
 }
 function routeUrlFor(view){
   const url=new URL(location.href); url.searchParams.set('view',view); url.searchParams.delete('memory');
-  ['q','status','domain','source','sort'].forEach(k=>url.searchParams.delete(k));
+  ['q','status','domain','sort'].forEach(k=>url.searchParams.delete(k));
   const selectedNs=ns();
-  if(selectedNs && selectedNs!==ALL_NAMESPACES) url.searchParams.set('namespace', selectedNs); else url.searchParams.delete('namespace');
+  if(selectedNs!==ALL_NAMESPACES) url.searchParams.set('namespace', selectedNs); else url.searchParams.delete('namespace');
   if(view==='memories'){
-    const vals={q:$('#memorySearch')?.value||'',status:$('#statusFilter')?.value||'active',domain:$('#domainFilter')?.value||'',source:$('#sourceFilter')?.value||'',sort:$('#sortFilter')?.value||'created_at'};
+    const vals={q:$('#memorySearch')?.value||'',status:$('#statusFilter')?.value||'active',domain:$('#domainFilter')?.value||'',sort:$('#sortFilter')?.value||'created_at'};
     for(const [k,v] of Object.entries(vals)) if(v && !(['status','sort'].includes(k) && ['active','created_at'].includes(v))) url.searchParams.set(k,v);
   }
   return url;
@@ -79,7 +92,6 @@ function setView(view, opts={}){
     if(opts.query.q!==undefined) $('#memorySearch').value=opts.query.q||'';
     if(opts.query.status!==undefined) $('#statusFilter').value=opts.query.status||'active';
     if(opts.query.domain!==undefined) $('#domainFilter').value=opts.query.domain||'';
-    if(opts.query.source!==undefined) $('#sourceFilter').value=opts.query.source||'';
     if(opts.query.sort!==undefined) $('#sortFilter').value=opts.query.sort||'created_at';
     updateMemoryAdvancedFilters();
   }
@@ -93,11 +105,11 @@ function setView(view, opts={}){
   $('#pageTitle').textContent=names[view]||view;
   if(view!=='visualiser') stopVisualiser();
   if(view!=='memories') closeMemoryDetail({silent:true});
-  if(view==='overview' && state.stats) requestAnimationFrame(()=>drawRecent(state.recentWrites||[]));
+  if(view==='overview' && state.stats) requestAnimationFrame(()=>drawRecent(state.recentWrites));
   if(view==='overview' && !state.stats) loadStats();
   if(view==='visualiser') loadVisualiser();
   if(view==='memories') loadMemories(); if(view==='recall' && !$('#recallQuery').value) $('#recallQuery').value='What should this agent remember about YantrikDB dashboards?';
-  if(view==='skills') { loadSkillRecallStatus(); loadRecentSkills(); }
+  if(view==='skills') loadSkillRecallStatus();
   if(view==='conflicts') loadConflicts(); if(view==='graph') loadEntities(); if(view==='identity-scope') loadIdentityScope(); if(view==='lifecycle') loadLifecycle(); if(view==='ops') loadHealthPanel(); if(view==='settings') loadSettings();
 }
 
@@ -132,11 +144,11 @@ async function init(){
   document.addEventListener('keydown',(e)=>{ if(e.key==='Escape'){ document.body.classList.remove('menu-open'); $('#menuToggle')?.setAttribute('aria-expanded','false'); closeMemoryDetail({silent:true}); } });
   $('#closeMemoryDrawer')?.addEventListener('click',()=>closeMemoryDetail());
   $('#memoryDrawer')?.addEventListener('click',(e)=>{ if(e.target.id==='memoryDrawer') closeMemoryDetail(); });
-  $('#scopeSelect')?.addEventListener('change',()=>{ setNamespace($('#scopeSelect').value); state.memoryOffset=0; writeRoute(state.view,{replace:true}); refreshAll(); });
-  $('#memoryNamespaceFilter')?.addEventListener('change',()=>{ setNamespace($('#memoryNamespaceFilter').value); state.memoryOffset=0; writeRoute('memories',{replace:true}); refreshAll(); });
+  $('#scopeSelect')?.addEventListener('change',()=>{ chooseNamespace($('#scopeSelect').value); state.memoryOffset=0; writeRoute(state.view,{replace:true}); refreshAll(); });
+  $('#memoryNamespaceFilter')?.addEventListener('change',()=>{ chooseNamespace($('#memoryNamespaceFilter').value); state.memoryOffset=0; writeRoute('memories',{replace:true}); refreshAll(); });
   $('#memoryApply').onclick=()=>{state.memoryOffset=0; writeRoute('memories',{replace:true}); loadMemories();};
-  $('#memoryReset')?.addEventListener('click',()=>{ $('#memorySearch').value=''; $('#statusFilter').value='active'; $('#domainFilter').value=''; $('#sourceFilter').value=''; $('#sortFilter').value='created_at'; updateMemoryAdvancedFilters(); state.memoryOffset=0; writeRoute('memories',{replace:true}); loadMemories(); });
-  $('#runRecall').onclick=runRecall; $('#loadRecentSkills')?.addEventListener('click',loadRecentSkills); $('#runSkillSearch')?.addEventListener('click',runSkillSearch); $('#skillSearchQuery')?.addEventListener('keydown',(e)=>{ if(e.key==='Enter') runSkillSearch(); }); $('#loadConflicts').onclick=loadConflicts;
+  $('#memoryReset')?.addEventListener('click',()=>{ $('#memorySearch').value=''; $('#statusFilter').value='active'; $('#domainFilter').value=''; $('#sortFilter').value='created_at'; updateMemoryAdvancedFilters(); state.memoryOffset=0; writeRoute('memories',{replace:true}); loadMemories(); });
+  $('#runRecall').onclick=runRecall; $('#runSkillSearch')?.addEventListener('click',runSkillSearch); $('#skillSearchQuery')?.addEventListener('keydown',(e)=>{ if(e.key==='Enter') runSkillSearch(); }); $('#loadConflicts').onclick=loadConflicts;
   $('#threeRefresh')?.addEventListener('click',()=>loadVisualiser(true));
   $('#threeReset')?.addEventListener('click',()=>resetVisualiser());
   $('#threePanMode')?.addEventListener('click',()=>{ threeVis.panMode=!threeVis.panMode; updateThreeUI(); });
@@ -147,18 +159,13 @@ async function init(){
   $('#threeRecallQuery')?.addEventListener('keydown',(e)=>{ if(e.key==='Enter') runVisualiserRecall(); });
   document.addEventListener('fullscreenchange',()=>{ if(state.view==='visualiser') requestAnimationFrame(()=>resizeThree()); });
   $$('.visualiser-tabs button[data-three-mode]').forEach(b=>b.onclick=()=>setVisualiserMode(b.dataset.threeMode));
-  $('#loadEntities').onclick=loadEntities; $('#loadGraph').onclick=()=>loadGraph($('#graphEntity').value||$('#entitySearch').value);
-  $('#reloadIdentityScope')?.addEventListener('click',()=>loadIdentityScope()); $('#saveIdentityScope')?.addEventListener('click',()=>saveIdentityScope());
-  $('#identityForm')?.addEventListener('submit', addIdentityFromForm); $('#actorForm')?.addEventListener('submit', addActorFromForm);
-  $('#spaceForm')?.addEventListener('submit', addSpaceFromForm); $('#conversationForm')?.addEventListener('submit', addConversationFromForm);
+  $('#loadEntities')?.addEventListener('click',loadEntities); $('#loadGraph')?.addEventListener('click',()=>loadGraph($('#graphEntity')?.value||$('#entitySearch')?.value));
+  $('#reloadIdentityScope')?.addEventListener('click',()=>loadIdentityScope());
   $('#runThink').onclick=runThink; $('#runHygieneScan')?.addEventListener('click',runHygieneScan); $('#refreshHealth').onclick=loadHealthPanel; $('#adminModeToggle')?.addEventListener('change',()=>saveSettings());
-  $('#saveMemoryScoping')?.addEventListener('click',()=>saveMemoryScopingSettings());
-  ['#ownerScopingToggle','#includeBaseRecallToggle','#includeActorRecallToggle','#topKSetting','#selfTuningRecallToggle','#selfTuningMaxBoost','#surfaceHygieneToggle','#hygieneMaxSurfaced'].forEach(sel=>$(sel)?.addEventListener('change',()=>saveMemoryScopingSettings({silent:true})));
-  $('#savePassword')?.addEventListener('click',()=>saveSettings({password:true}));
-  $('#disablePassword')?.addEventListener('click',()=>saveSettings({disablePassword:true}));
+
   $('#logoutBtn')?.addEventListener('click',logout);
   $('#signOutButton')?.addEventListener('click',logout);
-  window.addEventListener('resize',()=>{ if(state.view==='overview' && state.recentWrites) requestAnimationFrame(()=>drawRecent(state.recentWrites)); });
+  window.addEventListener('resize',()=>{ if(state.view==='overview' && state.stats) requestAnimationFrame(()=>drawRecent(state.recentWrites)); });
   try{ await refreshAll(); }catch(e){ toast(e.message); return; }
   const initialView = new URLSearchParams(location.search).get('view') || 'overview';
   setView(initialView,{replace:true,fromUrl:true});
@@ -169,11 +176,8 @@ function updateAdminBadge(){ const on=!!(state.health?.admin_enabled||state.sett
 
 function selectedNamespaceMeta(){
   const current=ns();
-  const rows=state.health?.namespaces||[];
-  const total=rows.reduce((a,n)=>a+Number(n.count||0),0);
-  if(current===ALL_NAMESPACES) return {name:'All namespaces', count:total, all:true};
-  const found=rows.find(n=>n.namespace===current);
-  return {name:current || state.defaultNamespace, count:found?.count ?? null, all:false};
+  if(current===ALL_NAMESPACES) return {name:'All namespaces',count:null,all:true};
+  return {name:current===''?'(empty namespace)':current,count:null,all:false};
 }
 function updateScopeUi(){
   const meta=selectedNamespaceMeta();
@@ -186,32 +190,24 @@ function updateScopeUi(){
   if($('#settingsExportLink')) $('#settingsExportLink').href=`/api/export/memories.jsonl?namespace=${encodeURIComponent(ns())}&status=active`;
 }
 async function refreshAll(){
-  const loadingLabel = state.view==='visualiser' ? 'Building graph…' : 'Loading…';
+  const loadingLabel = state.view==='visualiser' ? 'Building visualiser…' : 'Loading…';
   setScopeLoading(true, loadingLabel);
   if(state.view==='visualiser') setVisualiserLoading(true, 'Building visualiser');
   try{
     state.health=await api('/api/health');
     state.settings=await api('/api/settings');
-    state.defaultNamespace=state.health.default_namespace;
-    const nsRows=state.health.namespaces||[];
-    const options=`<option value="${ALL_NAMESPACES}">All namespaces (${fmt(nsRows.reduce((a,n)=>a+Number(n.count||0),0))})</option>`+nsRows.map(n=>`<option value="${esc(n.namespace)}">${esc(n.namespace)} (${fmt(n.count)})</option>`).join('');
-    const memSel=$('#memoryNamespaceFilter'); const scopeSel=$('#scopeSelect');
-    const requested=new URLSearchParams(location.search).get('namespace');
-    let prev=(requested || state.selectedNamespace || ALL_NAMESPACES);
-    // HTTP-cluster mode has no local SQLite to enumerate namespaces from, so
-    // health.namespaces is empty. Sending __all__ to /v1/stats or /v1/memories
-    // would 400 because the server has no dashboard magic value — fall back to
-    // the configured default_namespace on first load (no URL param, no prior
-    // explicit choice) in that mode. Explicit __all__ picks still come through
-    // via requested.
-    if(state.health.mode==='http' && !requested && prev===ALL_NAMESPACES && state.defaultNamespace){
-      prev=state.defaultNamespace;
-    }
+    state.defaultNamespace=state.health.default_namespace || state.settings.default_namespace || 'default';
+    await loadIdentityScope();
+    const routeParams=new URLSearchParams(location.search);
+    const requested=routeParams.get('namespace');
+    const prev=routeParams.has('namespace')?requested:(state.initialized?state.selectedNamespace:state.defaultNamespace);
     state.selectedNamespace=prev;
-    [memSel,scopeSel].filter(Boolean).forEach(s=>{
-      s.innerHTML=options;
-      if(![...s.options].some(o=>o.value===prev)) s.insertAdjacentHTML('afterbegin',`<option value="${esc(prev)}">${esc(prev)}</option>`);
-      s.value=prev;
+    state.initialized=true;
+    const options=namespaceOptions(prev);
+    const memSel=$('#memoryNamespaceFilter'); const scopeSel=$('#scopeSelect');
+    [memSel,scopeSel].filter(Boolean).forEach(select=>{
+      select.innerHTML=options;
+      select.value=prev;
     });
     updateScopeUi();
     updateAdminBadge();
@@ -225,331 +221,64 @@ async function refreshAll(){
   }
 }
 
-
 function compactJson(value){ return JSON.stringify(value||{}, null, 2); }
-function chip(label, value){ return `<div class="scope-chip"><span>${esc(label)}</span><strong>${esc(value || '—')}</strong></div>`; }
-function scopeEmpty(title, body){ return `<div class="empty helpful-empty"><strong>${esc(title)}</strong><span>${esc(body)}</span></div>`; }
-function sourceLabel(item){
-  return item.source==='yantrikdb_identity_map'?'configured identity map':(item.source==='namespace_inventory'?'memory bucket discovery':'dashboard edit');
-}
-function identitySelectMarkup(selected, raw){
-  const cfg=identityConfig();
-  const ids=availableIdentityOptions(cfg).filter(Boolean);
-  const opts=['', ...ids].filter((v,i,a)=>a.indexOf(v)===i);
-  return `<select class="inline-identity-select" data-actor-select="${esc(raw)}" aria-label="Identity for ${esc(raw)}">${opts.map(id=>`<option value="${esc(id)}" ${id===(selected||'')?'selected':''}>${esc(id || 'Unassigned')}</option>`).join('')}</select>`;
-}
-function renderScopeRows(items, kind){
-  if(!items?.length){
-    const copy={
-      identities:['No people yet.','Detected actors can be assigned once a person exists.'],
-      actors:['No actors detected yet.','When WhatsApp, Telegram, or other platforms appear in identity config, they show here automatically.'],
-      spaces:['No shared spaces yet.','Create one for household, team, or group-chat memory.'],
-      conversations:['No chat routes yet.','Choose which shared space each group chat should use.'],
-    }[kind] || ['Nothing configured.','Add rows below.'];
-    return scopeEmpty(copy[0], copy[1]);
-  }
-  return items.map((item, idx)=>{
-    const title=item.label || item.name || item.id || item.actor_id || item.conversation_id || item.scope || 'Unlabelled';
-    const pieces=[]; let actions=''; let detail='';
-    if(kind==='identities'){
-      pieces.push(chip('Person ID', item.id), chip('Display name', item.label || item.id));
-      detail = `<details class="scope-technical"><summary>Technical details</summary><div><span>Owner ID</span><code>${esc(item.private_scope || '')}</code></div>${item.resolved_scope?`<div><span>Storage namespace</span><code>${esc(item.resolved_scope)}</code></div>`:''}${item.source?`<div><span>Source</span><code>${esc(sourceLabel(item))}</code></div>`:''}</details>`;
-      actions = `<button class="btn tiny secondary" type="button" data-edit-identity="${esc(item.id||'')}">Edit person</button>`;
-    }
-    if(kind==='actors'){
-      const raw = `${item.platform||''}:${item.actor_id||''}`;
-      pieces.push(chip('Platform', item.platform), chip('Actor ID', item.actor_id));
-      if(item.alias) pieces.push(chip('Known alias', item.alias));
-      detail = `<details class="scope-technical"><summary>Technical details</summary>${item.legacy_scope?`<div><span>Namespace</span><code>${esc(item.legacy_scope)}</code></div>`:''}${item.source?`<div><span>Source</span><code>${esc(sourceLabel(item))}</code></div>`:''}</details>`;
-      actions = `<div class="inline-identity-control"><span>Identity</span><div class="inline-identity-actions">${identitySelectMarkup(item.identity, raw)}<button class="btn tiny primary" type="button" data-save-actor-identity="${esc(raw)}">Save</button></div></div>`;
-      return `<div class="scope-card actor-row"><div class="actor-main"><strong>${esc(title)}</strong><div class="scope-chip-row">${pieces.join('')}</div>${detail}</div>${actions}</div>`;
-    }
-    if(kind==='spaces'){
-      pieces.push(chip('Shared space', item.id), chip('Members', Array.isArray(item.members)?item.members.join(', '):(item.members||'')));
-      detail = `<details class="scope-technical"><summary>Technical scope</summary><code>${esc(item.scope || '')}</code></details>`;
-      actions = `<button class="btn tiny secondary" type="button" data-edit-space="${esc(item.id||'')}">Edit space</button>`;
-    }
-    if(kind==='conversations'){
-      pieces.push(chip('Platform', item.platform), chip('Chat', item.conversation_id), chip('Shared space', item.scope));
-      actions = `<button class="btn tiny secondary" type="button" data-edit-conversation="${esc((item.platform||'')+':'+(item.conversation_id||''))}">Edit route</button>`;
-    }
-    return `<div class="scope-card"><div class="scope-card-head"><strong>${esc(title)}</strong>${actions}</div><div class="scope-chip-row">${pieces.join('')}</div>${detail}</div>`;
-  }).join('');
-}
-function bindIdentityScopeRowActions(){
-  $$('[data-edit-identity]').forEach(btn=>btn.onclick=()=>fillIdentityForm(btn.dataset.editIdentity));
-  $$('[data-save-actor-identity]').forEach(btn=>btn.onclick=()=>saveInlineActorIdentity(btn.dataset.saveActorIdentity));
-  $$('[data-edit-space]').forEach(btn=>btn.onclick=()=>fillSpaceForm(btn.dataset.editSpace));
-  $$('[data-edit-conversation]').forEach(btn=>btn.onclick=()=>fillConversationForm(btn.dataset.editConversation));
-}
-
-function identityConfig(){
-  const cfg=state.identityScope?.identity_scope || {};
-  return {
-    identities:[...(cfg.identities||[])],
-    actors:[...(cfg.actors||[])],
-    spaces:[...(cfg.spaces||[])],
-    conversations:[...(cfg.conversations||[])],
-  };
-}
-function cleanId(value){ return String(value||'').trim(); }
-function csvList(value){ return String(value||'').split(',').map(v=>v.trim()).filter(Boolean); }
-function upsertBy(list, item, keyFn){
-  const key=keyFn(item); const idx=list.findIndex(existing=>keyFn(existing)===key);
-  if(idx>=0) list[idx]={...list[idx],...item}; else list.push(item);
-}
-function availableIdentityOptions(cfg){
-  const ids=(cfg.identities||[]).map(i=>i.id).filter(Boolean);
-  return ids.length ? ids : [''];
-}
-function identityLabel(id, cfg=identityConfig()){
-  const item=(cfg.identities||[]).find(i=>i.id===id);
-  return item?.label || id;
-}
-function availableScopeOptions(cfg){
-  const scopes=[];
-  (cfg.spaces||[]).forEach(s=>{ if(s.scope) scopes.push({value:s.scope, label:s.label || s.id || s.scope}); });
-  return scopes.filter(s=>s.value);
-}
-function availablePlatformOptions(cfg){
-  const vals=['whatsapp','telegram', ...(cfg.actors||[]).map(a=>a.platform), ...(cfg.conversations||[]).map(c=>c.platform)].filter(Boolean);
-  return [...new Set(vals)];
-}
-function availableConversationOptions(cfg){
-  return [...new Set((cfg.conversations||[]).map(c=>c.conversation_id).filter(Boolean))];
-}
-function selectedSpaceMembers(){
-  return $$('[data-space-member]:checked').map(el=>el.value).filter(Boolean);
-}
-function renderSpaceMemberChecklist(cfg, selected=[]){
-  const wrap=$('#spaceMembersChecklist'); if(!wrap) return;
-  const ids=availableIdentityOptions(cfg).filter(Boolean);
-  if(!ids.length){ wrap.innerHTML='<span class="muted">Create people first, then choose members here.</span>'; return; }
-  const selectedSet=new Set(selected||[]);
-  wrap.innerHTML=`<div class="checkbox-list-title">Members</div><div class="checkbox-pill-row">`+ids.map(id=>{ const label=identityLabel(id,cfg); return `<label class="checkbox-pill"><input type="checkbox" data-space-member value="${esc(id)}" aria-label="Shared space member ${esc(label)}" ${selectedSet.has(id)?'checked':''} /><span>${esc(label)}</span></label>`; }).join('')+`</div>`;
-}
-function actorIdentityFilterOptions(cfg){
-  const ids=availableIdentityOptions(cfg).filter(Boolean);
-  const hasUnassigned=(cfg.actors||[]).some(a=>!a.identity);
-  const opts=[{value:'__all__', label:'All'}];
-  ids.forEach(id=>opts.push({value:id, label:id}));
-  if(hasUnassigned) opts.push({value:'__unassigned__', label:'Unassigned'});
-  return opts;
-}
-function renderActorIdentityFilter(cfg){
-  const sel=$('#actorIdentityFilter'); if(!sel) return;
-  const opts=actorIdentityFilterOptions(cfg);
-  if(!opts.some(o=>o.value===state.actorIdentityFilter)) state.actorIdentityFilter='__all__';
-  sel.innerHTML=opts.map(o=>`<option value="${esc(o.value)}" ${o.value===state.actorIdentityFilter?'selected':''}>${esc(o.label)}</option>`).join('');
-  sel.onchange=()=>{ state.actorIdentityFilter=sel.value || '__all__'; renderIdentityScope(state.identityScope); };
-}
-function filteredActors(cfg){
-  const actors=cfg.actors||[];
-  if(state.actorIdentityFilter==='__unassigned__') return actors.filter(a=>!a.identity);
-  if(state.actorIdentityFilter && state.actorIdentityFilter!=='__all__') return actors.filter(a=>a.identity===state.actorIdentityFilter);
-  return actors;
-}
-
-function renderIdentityScopeSelectors(cfg){
-  const actorSel=$('#actorIdentity');
-  if(actorSel){
-    const current=actorSel.value; const options=availableIdentityOptions(cfg);
-    actorSel.innerHTML=options.map(id=>`<option value="${esc(id)}">${esc(id || 'Choose identity')}</option>`).join('');
-    if(options.includes(current)) actorSel.value=current;
-  }
-  renderSpaceMemberChecklist(cfg, selectedSpaceMembers());
-  const platformSel=$('#conversationPlatform');
-  if(platformSel){
-    const current=platformSel.value; const options=availablePlatformOptions(cfg);
-    platformSel.innerHTML=(options.length?options:['']).map(platform=>`<option value="${esc(platform)}">${esc(platform || 'Choose platform')}</option>`).join('');
-    if(options.includes(current)) platformSel.value=current;
-  }
-  const chatOptions=$('#conversationIdOptions');
-  if(chatOptions){ chatOptions.innerHTML=availableConversationOptions(cfg).map(id=>`<option value="${esc(id)}"></option>`).join(''); }
-  const scopeSel=$('#conversationScope');
-  if(scopeSel){
-    const current=scopeSel.value; const options=availableScopeOptions(cfg);
-    scopeSel.innerHTML=(options.length?options:[{value:'',label:'Create a shared space first'}]).map(scope=>`<option value="${esc(scope.value)}">${esc(scope.label)}</option>`).join('');
-    if(options.some(o=>o.value===current)) scopeSel.value=current;
-  }
-}
-async function persistIdentityConfig(cfg, message='Identity & Scope registry saved'){
-  $('#identityScopeJson').value=compactJson(cfg);
-  const data=await api('/api/identity-scope',{method:'POST',body:JSON.stringify({identity_scope:cfg})});
-  renderIdentityScope(data); toast(message);
-}
-
-async function saveInlineActorIdentity(raw){
-  const cfg=identityConfig();
-  const actor=(cfg.actors||[]).find(a=>`${a.platform}:${a.actor_id}`===raw);
-  const select=document.querySelector(`[data-actor-select="${CSS.escape(raw)}"]`);
-  if(!actor || !select){ toast('Actor row not found'); return; }
-  actor.identity=select.value || '';
-  try{ await persistIdentityConfig(cfg, actor.identity ? 'Actor identity updated' : 'Actor marked unassigned'); }catch(err){ toast(err.message || 'Could not update actor identity'); }
-}
-
-function fillIdentityForm(id){
-  const item=(identityConfig().identities||[]).find(i=>i.id===id); if(!item) return;
-  $('#identityId').value=item.id||''; $('#identityLabel').value=item.label||''; $('#identityPrivateScope').value=item.private_scope||'';
-  $('#identitySubmit').textContent='Update person'; $('#identityId').focus();
-}
-function fillActorForm(raw){
-  const cfg=identityConfig(); const item=(cfg.actors||[]).find(a=>`${a.platform}:${a.actor_id}`===raw); if(!item) return;
-  $('#actorPlatform').value=item.platform||''; $('#actorId').value=item.actor_id||''; renderIdentityScopeSelectors(cfg); $('#actorIdentity').value=item.identity||''; $('#actorIdentity').focus();
-}
-function fillSpaceForm(id){
-  const item=(identityConfig().spaces||[]).find(s=>s.id===id); if(!item) return;
-  $('#spaceId').value=item.id||''; $('#spaceLabel').value=item.label||''; $('#spaceScope').value=item.scope||''; renderSpaceMemberChecklist(identityConfig(), Array.isArray(item.members)?item.members:csvList(item.members||'')); $('#spaceId').focus();
-}
-function fillConversationForm(raw){
-  const cfg=identityConfig(); const item=(cfg.conversations||[]).find(c=>`${c.platform}:${c.conversation_id}`===raw); if(!item) return;
-  $('#conversationPlatform').value=item.platform||''; $('#conversationId').value=item.conversation_id||''; renderIdentityScopeSelectors(cfg); $('#conversationScope').value=item.scope||''; $('#conversationScope').focus();
-}
-
-async function addIdentityFromForm(e){
-  e.preventDefault();
-  const id=cleanId($('#identityId')?.value);
-  if(!id){ toast('Enter an identity ID first'); return; }
-  const cfg=identityConfig();
-  const privateScope=cleanId($('#identityPrivateScope')?.value) || `owner:${id}`;
-  upsertBy(cfg.identities,{id,label:cleanId($('#identityLabel')?.value)||id,private_scope:privateScope}, item=>item.id);
-  try{ await persistIdentityConfig(cfg, 'Person saved'); e.target.reset(); $('#identitySubmit').textContent='Save person'; }catch(err){ toast(err.message || 'Could not save person'); }
-}
-async function addActorFromForm(e){
-  e.preventDefault();
-  const platform=cleanId($('#actorPlatform')?.value); const actor_id=cleanId($('#actorId')?.value); const identity=cleanId($('#actorIdentity')?.value);
-  if(!platform || !actor_id || !identity){ toast('Enter platform, actor ID, and identity'); return; }
-  const cfg=identityConfig();
-  upsertBy(cfg.actors,{platform,actor_id,identity}, item=>`${item.platform}:${item.actor_id}`);
-  try{ await persistIdentityConfig(cfg, 'Actor mapped'); e.target.reset(); renderIdentityScopeSelectors(cfg); }catch(err){ toast(err.message || 'Could not map actor'); }
-}
-async function addSpaceFromForm(e){
-  e.preventDefault();
-  const id=cleanId($('#spaceId')?.value);
-  if(!id){ toast('Enter a shared space ID first'); return; }
-  const cfg=identityConfig();
-  const scope=cleanId($('#spaceScope')?.value) || `space:${id}`;
-  upsertBy(cfg.spaces,{id,label:cleanId($('#spaceLabel')?.value)||id,scope,members:selectedSpaceMembers()}, item=>item.id);
-  try{ await persistIdentityConfig(cfg, 'Shared space added'); e.target.reset(); }catch(err){ toast(err.message || 'Could not add shared space'); }
-}
-async function addConversationFromForm(e){
-  e.preventDefault();
-  const platform=cleanId($('#conversationPlatform')?.value); const conversation_id=cleanId($('#conversationId')?.value); const scope=cleanId($('#conversationScope')?.value);
-  if(!platform || !conversation_id || !scope){ toast('Choose platform, chat ID, and shared space'); return; }
-  const cfg=identityConfig();
-  upsertBy(cfg.conversations,{platform,conversation_id,scope}, item=>`${item.platform}:${item.conversation_id}`);
-  try{ await persistIdentityConfig(cfg, 'Chat route saved'); e.target.reset(); renderIdentityScopeSelectors(cfg); }catch(err){ toast(err.message || 'Could not route chat'); }
-}
-
 function renderIdentityScope(data){
   state.identityScope=data;
-  const cfg=data.identity_scope||{}; const summary=data.summary||{}; const runtime=data.runtime_scope||{};
-  $('#identityScopeSummary').innerHTML=[['People',summary.identities],['Actors',summary.actors],['Shared spaces',summary.spaces],['Chat routes',summary.conversations],['Needs review',summary.unmapped_namespaces]].map(([k,v])=>`<div class="metric"><div class="metric-label">${esc(k)}</div><div class="metric-value">${esc(fmt(v||0))}</div></div>`).join('');
-  $('#identityScopingStatus').innerHTML=[
-    ['Person scoping', runtime.owner_scoping, 'owner_scoping'],
-    ['Shared fallback', runtime.include_base_namespace_recall, 'include_base_namespace_recall'],
-    ['Old actor recall', runtime.include_legacy_actor_namespace_recall, 'include_legacy_actor_namespace_recall'],
-  ].map(([label,on,key])=>`<span class="scope-status ${on?'on':'off'}"><strong>${esc(label)}: ${on?'On':'Off'}</strong><code title="${esc(key)}">${esc(key)}</code></span>`).join('');
-  $('#identityList').innerHTML=renderScopeRows(cfg.identities,'identities');
-  renderActorIdentityFilter(cfg);
-  $('#actorList').innerHTML=renderScopeRows(filteredActors(cfg),'actors');
-  $('#spaceList').innerHTML=renderScopeRows(cfg.spaces,'spaces');
-  $('#conversationList').innerHTML=renderScopeRows(cfg.conversations,'conversations');
-  $('#identityNamespaceTable').innerHTML=(data.namespace_inventory||[]).length ? `<div class="namespace-coverage-list">${(data.namespace_inventory||[]).map(n=>{
-    const type=(n.mapping_type || '').replaceAll('_',' ');
-    const source=n.mapping_source ? ` · ${n.mapping_source}` : '';
-    const belongs=n.mapped?`<div class="mapped-owner"><strong>${esc(n.mapped_to || 'Mapped')}</strong><span>${esc(type + source)}</span></div>`:'<span class="muted">No person, shared space, or enabled fallback yet</span>';
-    const status=n.mapped?(n.derived_by_config?'Covered by settings':'Mapped'):'Needs review';
-    const pillClass=n.mapped?(n.derived_by_config?'good':'neutral'):'warn';
-    return `<article class="namespace-coverage-card"><div class="namespace-coverage-head"><div><span class="coverage-label">Namespace</span><code title="${esc(n.namespace)}">${esc(n.namespace)}</code></div><span class="pill coverage-status ${pillClass}">${esc(status)}</span></div><div class="namespace-coverage-body"><div><span class="coverage-label">Rows</span><strong>${fmt(n.count)}</strong></div><div><span class="coverage-label">Belongs to</span>${belongs}</div></div></article>`;
-  }).join('')}</div>` : scopeEmpty('No namespaces found.','Memory buckets will appear here once YantrikDB has rows.');
-  $('#identityScopeJson').value=compactJson(cfg);
-  renderIdentityScopeSelectors(cfg);
-  bindIdentityScopeRowActions();
-}
-
-async function loadIdentityScope(){
-  const data=await api('/api/identity-scope');
-  renderIdentityScope(data);
-}
-async function saveIdentityScope(){
-  try{
-    const parsed=JSON.parse($('#identityScopeJson').value||'{}');
-    const data=await api('/api/identity-scope',{method:'POST',body:JSON.stringify({identity_scope:parsed})});
-    renderIdentityScope(data); toast('Identity & Scope registry saved');
-  }catch(e){ toast(e.message || 'Invalid Identity & Scope JSON'); }
-}
-
-function settingsRows(s){
-  const y=s.yantrikdb||{};
-  const rows=[
-    ['Admin mode', s.admin_mode ? 'Enabled' : 'Read-only'],
-    ['Authentication', s.supabase_auth_enabled ? 'Supabase Auth' : (s.password_enabled ? 'Local password' : 'Not configured')],
-    ['Backend mode', y.mode || 'embedded'],
-    ['Base namespace', y.namespace || 'hermes'],
-    ['Default scope', y.default_namespace || s.default_namespace],
-    ['Self-tuning recall', y.self_tuning_recall ? `Enabled · max +${y.self_tuning_max_boost}` : 'Disabled'],
-    ['Prompt hygiene surfacing', y.surface_hygiene ? `Enabled · ${fmt(y.hygiene_max_surfaced)} candidates` : 'Disabled'],
-    ['Database', s.db_path],
-    ['Provider config', y.config_path || ''],
-    ['Provider map', y.identity_map_path || 'not set'],
-    ['Embedder', `${s.embedder} (${s.embedding_dim}d)`],
+  const scope=data?.identity_scope||{};
+  const rows=Array.isArray(data?.namespace_inventory)?data.namespace_inventory:[];
+  const summary=[
+    ['Visible server scopes', rows.length],
+    ['Identities', Array.isArray(scope.identities)?scope.identities.length:null],
+    ['Actors', Array.isArray(scope.actors)?scope.actors.length:null],
+    ['Shared spaces', Array.isArray(scope.spaces)?scope.spaces.length:null],
+    ['Conversation routes', Array.isArray(scope.conversations)?scope.conversations.length:null],
   ];
-  return rows.map(([k,v])=>`<div class="diag-row"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join('');
+  if($('#identityScopeSummary')) $('#identityScopeSummary').innerHTML=summary.map(([label,value])=>`<div class="metric"><div class="metric-label">${esc(label)}</div><div class="metric-value">${fmt(value)}</div></div>`).join('');
+  if($('#identityNamespaceTable')){
+    $('#identityNamespaceTable').innerHTML=rows.length?`<table><thead><tr><th>Visible tenant / database</th><th>Row count</th><th>Identity mapping</th></tr></thead><tbody>${rows.map(row=>`<tr><td><code>${esc(row.namespace||'')}</code></td><td>${fmt(row.count)}</td><td>${row.mapped===true?esc(row.mapped_to||row.mapped_scope||'Mapped'):(row.mapped===false?'Not mapped':'Not provided')}</td></tr>`).join('')}</tbody></table>`:'<div class="empty helpful-empty"><strong>No server scope inventory was returned.</strong><span>Check the server token permissions and the YantrikDB /v1/identity-scope response.</span></div>';
+  }
+  if($('#identityScopeJson')) $('#identityScopeJson').value=compactJson(data);
+  updateScopeUi();
+}
+async function loadIdentityScope(){
+  try{ renderIdentityScope(await api('/api/identity-scope')); }
+  catch(e){
+    state.identityScope=null;
+    if($('#identityScopeSummary')) $('#identityScopeSummary').innerHTML=`<div class="empty">${esc(e.message)}</div>`;
+    if($('#identityNamespaceTable')) $('#identityNamespaceTable').innerHTML=`<div class="empty">${esc(e.message)}</div>`;
+    if($('#identityScopeJson')) $('#identityScopeJson').value='';
+  }
+}
+
+function settingsRows(settings){
+  const rows=[
+    ['Backend mode', settings.backend_mode],
+    ['YantrikDB server', settings.server_url],
+    ['Default namespace', settings.default_namespace],
+    ['Supabase Auth', settings.supabase_auth_configured?'Configured':'Publishable key required'],
+    ['Admin mode', settings.admin_mode?'Enabled':'Read-only'],
+  ];
+  return rows.map(([key,value])=>`<div class="diag-row"><span>${esc(key)}</span><strong>${esc(value ?? '—')}</strong></div>`).join('');
 }
 async function loadSettings(){
   state.settings=await api('/api/settings');
   const toggle=$('#adminModeToggle'); if(toggle) toggle.checked=!!state.settings.admin_mode;
-  const y=state.settings.yantrikdb||{};
-  const ownerToggle=$('#ownerScopingToggle'); if(ownerToggle) ownerToggle.checked=!!y.owner_scoping;
-  const baseToggle=$('#includeBaseRecallToggle'); if(baseToggle) baseToggle.checked=!!y.include_base_namespace_recall;
-  const actorToggle=$('#includeActorRecallToggle'); if(actorToggle) actorToggle.checked=!!y.include_legacy_actor_namespace_recall;
-  const topK=$('#topKSetting'); if(topK) topK.value=y.top_k||10;
-  const selfTuning=$('#selfTuningRecallToggle'); if(selfTuning) selfTuning.checked=!!y.self_tuning_recall;
-  const selfBoost=$('#selfTuningMaxBoost'); if(selfBoost) selfBoost.value=y.self_tuning_max_boost ?? 0.15;
-  const surfHygiene=$('#surfaceHygieneToggle'); if(surfHygiene) surfHygiene.checked=!!y.surface_hygiene;
-  const hygieneMax=$('#hygieneMaxSurfaced'); if(hygieneMax) hygieneMax.value=y.hygiene_max_surfaced || 5;
-  const passwordState=$('#passwordState'); if(passwordState) passwordState.textContent=state.settings.password_enabled?'Password enabled. Changes clear saved browser sessions.':'Password disabled.';
+  if($('#settingsServerUrl')) $('#settingsServerUrl').textContent=state.settings.server_url||'—';
+  if($('#settingsNamespace')) $('#settingsNamespace').textContent=state.settings.default_namespace||'—';
+  if($('#settingsAuthState')){
+    $('#settingsAuthState').textContent=state.settings.supabase_auth_configured?'Supabase Auth':'Setup required';
+    $('#settingsAuthState').className=state.settings.supabase_auth_configured?'pill good':'pill warn';
+  }
   updateScopeUi();
-  $('#settingsRuntime').innerHTML=settingsRows(state.settings);
+  if($('#settingsRuntime')) $('#settingsRuntime').innerHTML=settingsRows(state.settings);
   updateAdminBadge();
 }
-async function saveMemoryScopingSettings(opts={}){
-  const payload={
-    admin_mode:!!$('#adminModeToggle')?.checked,
-    owner_scoping:!!$('#ownerScopingToggle')?.checked,
-    include_base_namespace_recall:!!$('#includeBaseRecallToggle')?.checked,
-    include_legacy_actor_namespace_recall:!!$('#includeActorRecallToggle')?.checked,
-    top_k:Number($('#topKSetting')?.value || 10),
-    self_tuning_recall:!!$('#selfTuningRecallToggle')?.checked,
-    self_tuning_max_boost:Number($('#selfTuningMaxBoost')?.value || 0.15),
-    surface_hygiene:!!$('#surfaceHygieneToggle')?.checked,
-    hygiene_max_surfaced:Number($('#hygieneMaxSurfaced')?.value || 5),
-  };
-  try{
-    state.settings=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
-    await loadSettings();
-    if(!opts.silent) toast('Memory settings saved');
-  }catch(e){ toast(e.message || 'Could not save memory settings'); await loadSettings(); }
-}
-
-async function saveSettings(opts={}){
+async function saveSettings(){
   const enabled=!!$('#adminModeToggle')?.checked;
-  const payload={admin_mode:enabled};
-  if(opts.password){
-    const pw=$('#dashboardPassword')?.value||'';
-    if(!pw.trim()){ toast('Enter a new password first'); return; }
-    payload.new_password=pw;
-  }
-  if(opts.disablePassword) payload.disable_password=true;
   try{
-    state.settings=await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
-    if($('#dashboardPassword')) $('#dashboardPassword').value='';
-    if(opts.password) { showLogin(); toast('Password changed — log in again'); return; }
-    state.health=await api('/api/health');
+    state.settings=await api('/api/settings',{method:'POST',body:JSON.stringify({admin_mode:enabled})});
     await loadSettings();
-    if(opts.disablePassword) toast('Password disabled');
-    else toast(enabled?'Admin Mode enabled':'Admin Mode disabled');
+    toast(enabled?'Admin Mode enabled':'Admin Mode disabled');
   }catch(e){toast(e.message); await loadSettings();}
 }
 
@@ -567,22 +296,24 @@ async function logout(){
 async function loadStats(){
   state.stats=await api(`/api/stats?namespace=${encodeURIComponent(ns())}`);
   const engine=state.stats.engine||{};
-  const active = engine.active_memories ?? (state.stats.memory_status||[]).find(x=>x.status==='active')?.count ?? 0;
-  const consolidated = engine.consolidated_memories ?? (state.stats.memory_status||[]).find(x=>x.status==='consolidated')?.count ?? 0;
-  const tomb = engine.tombstoned_memories ?? (state.stats.memory_status||[]).find(x=>x.status==='tombstoned')?.count ?? 0;
-  const metrics=[['Active',active],['Consolidated',consolidated],['Forgotten',tomb],['Open conflicts',state.stats.open_conflicts],['Entities',state.stats.entities],['Edges',state.stats.edges],['DB size',humanBytes(state.health.db_size_bytes)],['Embedder',state.health.embedder]];
+  const active = engine.active_memories ?? null;
+  const consolidated = engine.consolidated_memories ?? null;
+  const tomb = engine.tombstoned_memories ?? null;
+  const metrics=[['Active',active],['Consolidated',consolidated],['Forgotten',tomb],['Open conflicts',state.stats.open_conflicts],['Entities',state.stats.entities],['Edges',state.stats.edges],['DB size',humanBytes(state.health?.db_size_bytes)],['Embedder',state.health?.embedder]];
   if($('#heroMetrics')) $('#heroMetrics').innerHTML=metrics.slice(0,4).map(m=>metric(m[0],m[1])).join('');
-  $('#statsGrid').innerHTML=metrics.map(m=>`<div class="stat-card"><div class="stat-label">${esc(m[0])}</div><div class="stat-value">${esc(fmt(m[1]))}</div></div>`).join('');
-  $('#composition').innerHTML=compositionBlock('Domains',state.stats.by_domain)+compositionBlock('Sources',state.stats.by_source)+compositionBlock('Types',state.stats.by_type);
-  state.recentWrites=state.stats.recent_by_day||[];
+  if($('#statsGrid')) $('#statsGrid').innerHTML=metrics.map(m=>`<div class="stat-card"><div class="stat-label">${esc(m[0])}</div><div class="stat-value">${esc(fmt(m[1]))}</div></div>`).join('');
+  if($('#composition')) $('#composition').innerHTML=compositionBlock('Domains',state.stats.by_domain)+compositionBlock('Sources',state.stats.by_source)+compositionBlock('Types',state.stats.by_type);
+  state.recentWrites=state.stats.recent_by_day;
   drawRecent(state.recentWrites);
-  $('#namespaceTable').innerHTML=`<table><thead><tr><th>Memory scope</th><th>Rows</th></tr></thead><tbody>${(state.health.namespaces||[]).map(n=>`<tr><td><code>${esc(n.namespace)}</code></td><td>${fmt(n.count)}</td></tr>`).join('')}</tbody></table>`;
+  const namespaces=Array.isArray(state.identityScope?.namespace_inventory)?state.identityScope.namespace_inventory:[];
+  if($('#namespaceTable')) $('#namespaceTable').innerHTML=namespaces.length?`<table><thead><tr><th>Visible tenant / database</th><th>Row count</th><th>Identity mapping</th></tr></thead><tbody>${namespaces.map(row=>`<tr><td><code>${esc(row.namespace||'')}</code></td><td>${fmt(row.count)}</td><td>${row.mapped===true?esc(row.mapped_to||row.mapped_scope||'Mapped'):(row.mapped===false?'Not mapped':'Not provided')}</td></tr>`).join('')}</tbody></table>`:'<div class="empty helpful-empty"><strong>Server scope inventory unavailable.</strong><span>The HTTP identity-scope route does not provide row-tag counts.</span></div>'; 
+  const scopeNote=$('#statsScopeNote'); if(scopeNote) scopeNote.textContent='YantrikDB /v1/stats reports database-wide totals; namespace selection applies to memory and temporal queries, not these totals.';
   updateScopeUi();
 }
 
-function humanBytes(b){ if(!b) return '0 B'; const u=['B','KB','MB','GB']; let i=0; while(b>1024&&i<u.length-1){b/=1024;i++;} return `${b.toFixed(i?1:0)} ${u[i]}`; }
+function humanBytes(b){ if(b===null||b===undefined) return '—'; if(!b) return '0 B'; const u=['B','KB','MB','GB']; let i=0; while(b>1024&&i<u.length-1){b/=1024;i++;} return `${b.toFixed(i?1:0)} ${u[i]}`; }
 function metric(label,value){return `<div class="metric"><div class="metric-label">${esc(label)}</div><div class="metric-value">${esc(fmt(value))}</div></div>`}
-function compositionBlock(title, arr){ const max=Math.max(1,...(arr||[]).map(x=>x.count)); return `<div class="detail-section"><div class="label">${title}</div>${(arr||[]).slice(0,8).map(x=>`<div class="bar-row"><span>${esc(x.domain||x.source||x.type||'—')}</span><div class="bar"><span style="width:${(x.count/max)*100}%"></span></div><b>${fmt(x.count)}</b></div>`).join('')}</div>`; }
+function compositionBlock(title, arr){ if(!Array.isArray(arr)) return `<div class="detail-section"><div class="label">${title}</div><div class="muted">Not exposed by the YantrikDB HTTP statistics endpoint.</div></div>`; const max=Math.max(1,...arr.map(x=>x.count)); return `<div class="detail-section"><div class="label">${title}</div>${arr.slice(0,8).map(x=>`<div class="bar-row"><span>${esc(x.domain||x.source||x.type||'—')}</span><div class="bar"><span style="width:${(x.count/max)*100}%"></span></div><b>${fmt(x.count)}</b></div>`).join('')||'<div class="muted">No breakdown returned.</div>'}</div>`; }
 function formatShortDate(day){
   const date=new Date(`${day}T00:00:00`);
   if(Number.isNaN(date.getTime())) return String(day||'').slice(5);
@@ -604,8 +335,8 @@ function recentSummaryBlock(chart){
 }
 function drawRecent(data){
   const c=$('#recentChart'); if(!c) return;
-  const chart=(data||[]).filter(d=>d && d.day);
-  const summary=$('#recentSummary'); if(summary) summary.innerHTML=recentSummaryBlock(chart);
+  const chart=Array.isArray(data)?data.filter(d=>d && d.day):null;
+  const summary=$('#recentSummary'); if(summary) summary.innerHTML=chart===null?'<div class="muted">Recent-write history is not exposed by the YantrikDB HTTP API.</div>':recentSummaryBlock(chart);
   const rect=c.getBoundingClientRect();
   const parentW=c.parentElement?.clientWidth || 0;
   const cssW=Math.max(320, Math.floor(rect.width || parentW || 320));
@@ -615,10 +346,10 @@ function drawRecent(data){
   c.width=Math.floor(cssW*dpr); c.height=Math.floor(cssH*dpr);
   const ctx=c.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cssW,cssH);
   ctx.font='12px system-ui, -apple-system, BlinkMacSystemFont, sans-serif';
-  if(!chart.length){
+  if(chart===null || !chart.length){
     ctx.fillStyle='rgba(255,247,249,.52)';
     ctx.textAlign='center';
-    ctx.fillText('No recent writes in this scope', cssW/2, cssH/2);
+    ctx.fillText(chart===null?'Recent-write history is not exposed':'No recent writes returned', cssW/2, cssH/2);
     return;
   }
   const max=Math.max(1,...chart.map(d=>Number(d.count)||0));
@@ -665,23 +396,31 @@ function startVisualiser(){ stopVisualiser(); viz.frame=requestAnimationFrame(dr
 function bindVisualiserEvents(){ const canvas=$('#constellationCanvas'); if(!canvas||canvas.dataset.bound)return; canvas.dataset.bound='1'; const point=e=>{const r=canvas.getBoundingClientRect(); const t=e.touches?.[0]||e; return {x:t.clientX-r.left,y:t.clientY-r.top};}; const down=e=>{ if(e.button===2 && e.cancelable) e.preventDefault(); const p=point(e); const rightPan=e.button===2; if(!rightPan){ const hit=[...(viz.hits||[])].reverse().find(h=>Math.hypot(h.x-p.x,h.y-p.y)<=h.r); if(hit){inspectVisualNode(hit.node); return;} } viz.drag={x:p.x,y:p.y,rot:viz.rotation,tilt:viz.tilt,panX:viz.panX,panY:viz.panY,pan:rightPan||e.shiftKey||viz.interaction==='pan'}; canvas.setPointerCapture?.(e.pointerId);}; const move=e=>{ if(!viz.drag)return; const p=point(e), dx=p.x-viz.drag.x, dy=p.y-viz.drag.y; if(viz.drag.pan){viz.panX=viz.drag.panX+dx;viz.panY=viz.drag.panY+dy;} else {viz.rotation=viz.drag.rot+dx*.006;viz.tilt=Math.max(.15,Math.min(1.35,viz.drag.tilt+dy*.004));} }; const up=()=>{viz.drag=null;}; canvas.addEventListener('contextmenu',e=>e.preventDefault()); canvas.addEventListener('pointerdown',down); canvas.addEventListener('pointermove',move); canvas.addEventListener('pointerup',up); canvas.addEventListener('pointercancel',up); canvas.addEventListener('wheel',e=>{e.preventDefault(); viz.zoom=Math.max(.45,Math.min(4,viz.zoom*(e.deltaY>0?.92:1.09)));},{passive:false}); }
 
 async function loadMemories(){
-  const qs=new URLSearchParams({namespace:ns(),status:$('#statusFilter').value,q:$('#memorySearch').value,domain:$('#domainFilter').value,source:$('#sourceFilter').value,sort:$('#sortFilter').value,limit:50,offset:state.memoryOffset});
-  const data=await api('/api/memories?'+qs);
-  $('#memoryList').innerHTML=data.items.map(memoryItem).join('') || '<div class="empty helpful-empty"><strong>No memories found.</strong><span>Try clearing filters or switching memory scope.</span></div>';
-  $$('#memoryList .memory-item').forEach(el=>el.onclick=()=>selectMemory(el.dataset.rid));
-  $('#memoryPager').innerHTML=`<button class="btn secondary" ${state.memoryOffset<=0?'disabled':''} id="prevPage">Prev</button><span>${fmt(state.memoryOffset+1)}–${fmt(Math.min(state.memoryOffset+50,data.total))} of ${fmt(data.total)}</span><button class="btn secondary" ${state.memoryOffset+50>=data.total?'disabled':''} id="nextPage">Next</button>`;
-  $('#prevPage')?.addEventListener('click',()=>{state.memoryOffset=Math.max(0,state.memoryOffset-50);loadMemories();}); $('#nextPage')?.addEventListener('click',()=>{state.memoryOffset+=50;loadMemories();});
+  const params=new URLSearchParams({namespace:ns(),status:$('#statusFilter')?.value||'active',domain:$('#domainFilter')?.value||'',sort:$('#sortFilter')?.value||'created_at',limit:50,offset:state.memoryOffset});
+  try{
+    const data=await api('/api/memories?'+params);
+    const items=Array.isArray(data.items)?data.items:[];
+    state.namespaceTags=[...new Set([...(state.namespaceTags||[]),...items.map(item=>item.namespace).filter(value=>typeof value==='string')])];
+    const filter=($('#memorySearch')?.value||'').trim().toLowerCase();
+    const visible=filter?items.filter(item=>JSON.stringify(item).toLowerCase().includes(filter)):items;
+    $('#memoryList').innerHTML=visible.map(memoryItem).join('') || (filter?'<div class="empty helpful-empty"><strong>No matches on this page.</strong><span>The list endpoint does not support server-side text search. Use Recall for semantic search or clear this page filter.</span></div>':'<div class="empty helpful-empty"><strong>No memories found.</strong><span>Try clearing the domain filter or switching namespace.</span></div>');
+    $$('#memoryList .memory-item').forEach(el=>el.onclick=()=>selectMemory(el.dataset.rid));
+    const total=typeof data.total==='number'?data.total:null;
+    const shownEnd=total===null?null:Math.min(state.memoryOffset+items.length,total);
+    $('#memoryPager').innerHTML=`<button class="btn secondary" ${state.memoryOffset<=0?'disabled':''} id="prevPage">Prev</button><span>${fmt(state.memoryOffset+1)}–${fmt(shownEnd)} of ${fmt(total)}</span><button class="btn secondary" ${total===null || state.memoryOffset+50>=total?'disabled':''} id="nextPage">Next</button>`;
+    $('#prevPage')?.addEventListener('click',()=>{state.memoryOffset=Math.max(0,state.memoryOffset-50);loadMemories();});
+    $('#nextPage')?.addEventListener('click',()=>{state.memoryOffset+=50;loadMemories();});
+    const options=namespaceOptions(ns());
+    ['#scopeSelect','#memoryNamespaceFilter'].forEach(selector=>{const select=$(selector);if(select){select.innerHTML=options;select.value=ns();}});
+    updateScopeUi();
+  }catch(e){
+    $('#memoryList').innerHTML=`<div class="empty helpful-empty"><strong>Memory list request failed.</strong><span>${esc(e.message)}</span></div>`;
+    $('#memoryPager').innerHTML='';
+  }
 }
-function statusLabel(s){ return s==='tombstoned'?'forgotten':(s||'active'); }
-function statusPillClass(s){ const v=String(s||'active'); return v==='active' ? 'good' : (v==='tombstoned' ? 'hot' : 'neutral'); }
-function shortNamespace(value){
-  const raw=String(value||'');
-  if(!raw) return '';
-  const owner=raw.match(/owner:([^:]+)$/);
-  if(owner) return owner[1].replace(/^owner-/,'');
-  const parts=raw.split(':');
-  return parts.slice(-2).join(':') || raw;
-}
+function statusLabel(status){ return status==='tombstoned'?'forgotten':(status||'active'); }
+function statusPillClass(status){ const value=String(status||'active'); return value==='active'?'good':(value==='tombstoned'?'hot':'neutral'); }
+function shortNamespace(value){ const raw=String(value??''); return raw===''?'(empty)':(raw.split(':').slice(-2).join(':')||raw); }
 function memoryItem(m){
   const showNs=ns()===ALL_NAMESPACES;
   return `<div class="memory-item" data-rid="${esc(m.rid)}">
@@ -696,6 +435,9 @@ async function selectMemory(rid, opts={}){
   const m=await api('/api/memory/'+encodeURIComponent(rid)+'?namespace='+encodeURIComponent(ns()));
   $('.drawer-title').textContent='YantrikDB memory';
   $('#memoryDrawerBody').innerHTML=detailHtml(m);
+  $$('[data-copy-value]').forEach(button=>button.addEventListener('click',()=>showSelectableCopy(button.dataset.copyLabel||'Value',button.dataset.copyValue||'')));
+  $('#copyDrawerRid')?.addEventListener('click',event=>showSelectableCopy('RID',event.currentTarget.dataset.rid||''));
+  $('#forgetDrawerMemory')?.addEventListener('click',event=>forgetSelected(event.currentTarget.dataset.rid||''));
   $('#memoryDrawer').classList.remove('hidden');
   if(opts.updateUrl!==false){
     if(state.view!=='memories') setView('memories',{updateUrl:false});
@@ -720,8 +462,8 @@ function detailHtml(m){
     <h2 class="memory-detail-title">${title}</h2>
     <div class="detail-content">${esc(m.text)}</div>
     <div class="drawer-actions">
-      <button class="drawer-action" onclick="showSelectableCopy('RID','${rid}')">Copy RID</button>
-      <button class="drawer-action danger" onclick="forgetSelected('${rid}')">Forget memory</button>
+      <button id="copyDrawerRid" class="drawer-action" data-rid="${rid}">Copy RID</button>
+      <button id="forgetDrawerMemory" class="drawer-action danger" data-rid="${rid}">Forget memory</button>
     </div>
     <div class="diag-grid">
       ${diag('RID', rid, true)}${diag('Namespace', m.namespace, true)}${diag('Source', m.source)}${diag('Type', m.type)}${diag('Importance', Number(m.importance||0).toFixed(3))}${diag('Certainty', Number(m.certainty||0).toFixed(3))}${diag('Access count', m.access_count)}${diag('Created', m.created_at_iso)}${diag('Updated', m.updated_at_iso)}${diag('Embedding bytes', m.embedding_bytes)}
@@ -729,12 +471,12 @@ function detailHtml(m){
     ${arrSection('Metadata', m.metadata_json||{})}${arrSection('Entities',m.entities)}${arrSection('Claims',m.claims)}${arrSection('Consolidation',m.consolidation_sources)}
   </section>`;
 }
-function diag(k,v,copy=false){ const val=fmt(v); return `<div class="diag-row"><span>${esc(k)}</span><strong>${copy?`<button class="diag-link" onclick="showSelectableCopy('${esc(k)}','${esc(val)}')">${esc(val)}</button>`:esc(val)}</strong></div>`; }
+function diag(k,v,copy=false){ const val=fmt(v); return `<div class="diag-row"><span>${esc(k)}</span><strong>${copy?`<button type="button" class="diag-link" data-copy-label="${esc(k)}" data-copy-value="${esc(val)}">${esc(val)}</button>`:esc(val)}</strong></div>`; }
 function kv(k,v){return `<div>${esc(k)}</div><div>${esc(fmt(v))}</div>`}
 function arrSection(title, arr){ if(!arr||(Array.isArray(arr)&&!arr.length)||(typeof arr==='object'&&!Array.isArray(arr)&&!Object.keys(arr).length))return ''; return `<div class="detail-section"><div class="label">${title}</div><pre>${esc(JSON.stringify(arr,null,2))}</pre></div>`; }
 function showSelectableCopy(label,value){ const text=String(value||''); if(navigator.clipboard?.writeText){ navigator.clipboard.writeText(text).then(()=>toast(`${label} copied`)).catch(()=>toast(text)); } else { toast(text); } }
 function confirmAction(title,message){ return new Promise(resolve=>{ const modal=$('#confirmModal'); $('#confirmTitle').textContent=title; $('#confirmMessage').textContent=message; modal.classList.remove('hidden'); const done=v=>{modal.classList.add('hidden'); $('#confirmOk').onclick=null; $('#confirmCancel').onclick=null; resolve(v);}; $('#confirmOk').onclick=()=>done(true); $('#confirmCancel').onclick=()=>done(false); modal.onclick=e=>{ if(e.target===modal) done(false); }; }); }
-async function forgetSelected(rid){ if(!await confirmAction('Forget this memory?','This removes the memory from active recall and keeps an audit record. Admin Mode must be enabled.'))return; try{ const out=await api(`/api/memory/${encodeURIComponent(rid)}/forget`,{method:'POST',body:'{}'}); toast('Memory forgotten'); await loadMemories(); $('#memoryDrawerBody').innerHTML=`<pre>${esc(JSON.stringify(out,null,2))}</pre>`;}catch(e){toast(e.message)} }
+async function forgetSelected(rid){ if(!await confirmAction('Forget this memory?','This removes the memory from active recall and keeps an audit record. Admin Mode must be enabled.'))return; try{ const out=await api(`/api/memory/${encodeURIComponent(rid)}/forget?namespace=${encodeURIComponent(ns())}`,{method:'POST',body:'{}'}); toast('Memory forgotten'); await loadMemories(); $('#memoryDrawerBody').innerHTML=`<pre>${esc(JSON.stringify(out,null,2))}</pre>`;}catch(e){toast(e.message)} }
 
 function renderScoreBreakdown(scores={}){
   const contributions = scores.contributions || {};
@@ -755,76 +497,107 @@ async function runRecall(){
 }
 
 function renderSkillRecallCards(data){
-  const cards=$('#skillRecallCards');
-  if(!cards) return;
-  const exposed=data.skill_tools_exposed?'Exposed':'Disabled';
-  cards.innerHTML=[
-    ['Skill tools', exposed],
-    ['Auto attach', data.auto_skill_attach?'On':'Off'],
-    ['Min score', data.auto_skill_min_score ?? '—'],
-    ['Max bodies', data.auto_skill_max_bodies ?? '—'],
-    ['Recent', data.recent_skills_count ?? 0],
-  ].map(([label,value])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(value)}</div></div>`).join('');
+  const cards=$('#skillRecallCards'); if(!cards) return;
+  const capabilities=[
+    ['Semantic search','POST /v1/skills/search'],
+    ['Exact skill read','GET /v1/skills/{id}'],
+    ['Record outcome','POST /v1/skills/{id}/outcome'],
+    ['Outcome history','Not exposed'],
+    ['Recent surfacing','Not exposed'],
+  ];
+  cards.innerHTML=capabilities.map(([label,value])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(value)}</div></div>`).join('');
+  $('#skillRecallStatus').textContent=`HTTP backend · ${data.search_endpoint}`;
+  const warning=$('#skillRecallWarning');
+  if(warning){ warning.textContent='Outcome writes are supported; reading outcome history and recent surfacing history are not. The dashboard does not fabricate either view.'; warning.classList.remove('hidden'); }
 }
 async function loadSkillRecallStatus(){
-  try{
-    const data=await api('/api/skill-recall/status');
-    $('#skillRecallStatus').textContent = data.installed ? `${esc(data.mode||'embedded')} · ${data.skills_enabled?'skills enabled':'skills disabled'}` : 'skill recall unavailable';
-    renderSkillRecallCards(data);
-    const warn=$('#skillRecallWarning');
-    if(warn){ warn.textContent=data.warning||''; warn.classList.toggle('hidden', !data.warning); }
-  }catch(e){ $('#skillRecallStatus').textContent=e.message; }
+  try{ renderSkillRecallCards(await api('/api/skill-recall/status')); }
+  catch(e){ if($('#skillRecallStatus')) $('#skillRecallStatus').textContent=e.message; }
 }
-function renderSkillCard(s){
-  const id=s.skill_id||'unknown-skill';
-  const score=Number.isFinite(Number(s.score))?Number(s.score).toFixed(3):'—';
-  const tags=(s.applies_to||[]).join(', ')||'No tags';
-  return `<article class="memory-item skill-card" data-skill-id="${esc(id)}"><div class="memory-title">${esc(id)} <span class="muted">${esc(s.skill_type||'skill')}</span></div><div class="memory-text">${esc((s.body||'').slice(0,420)||'No body preview')}</div><div class="meta-row"><span class="pill good">score ${esc(score)}</span><span class="pill">${esc(tags)}</span></div></article>`;
+function renderSkillCard(skill){
+  const id=skill.skill_id||skill.rid||'Unknown skill';
+  const score=Number.isFinite(Number(skill.score))?Number(skill.score).toFixed(3):'—';
+  const tags=Array.isArray(skill.applies_to)?skill.applies_to.join(', '):'';
+  return `<article class="memory-item skill-card" data-skill-id="${esc(id)}"><div class="memory-title">${esc(id)} <span class="muted">${esc(skill.skill_type||'skill')}</span></div><div class="memory-text">${esc((skill.body||'').slice(0,420)||'Open to read the returned skill body.')}</div><div class="meta-row"><span class="pill good">score ${esc(score)}</span><span class="pill">${esc(tags||'No tags returned')}</span></div></article>`;
 }
 async function runSkillSearch(){
-  const query=$('#skillSearchQuery')?.value?.trim() || '';
+  const query=$('#skillSearchQuery')?.value?.trim()||'';
   if(!query){ toast('Enter a skill search query'); return; }
-  const body={query, top_k:Number($('#skillSearchTopK')?.value||5), applies_to:$('#skillSearchAppliesTo')?.value?.trim()||null};
+  const body={query,top_k:Number($('#skillSearchTopK')?.value||5),applies_to:$('#skillSearchAppliesTo')?.value?.trim()||null};
   try{
     const data=await api('/api/skill-recall/search',{method:'POST',body:JSON.stringify(body)});
-    const items=data.items||[];
-    $('#skillSearchResults').innerHTML = items.map(renderSkillCard).join('') || '<div class="empty helpful-empty"><strong>No DB-native skills matched.</strong><span>If skill recall is disabled, enable YANTRIKDB_SKILLS_ENABLED and restart the gateway/session.</span></div>';
-    $$('#skillSearchResults .skill-card').forEach((el,i)=>el.onclick=()=>showSkillOutcome(items[i]));
+    const items=Array.isArray(data.items)?data.items:[];
+    $('#skillSearchResults').innerHTML=items.map(renderSkillCard).join('')||'<div class="empty helpful-empty"><strong>No skills matched.</strong><span>The response was returned by YantrikDB; check the query, server token, and whether skills are enabled.</span></div>';
+    $$('#skillSearchResults .skill-card').forEach((el,index)=>el.onclick=()=>showSkillOutcome(items[index]));
     if(items[0]) showSkillOutcome(items[0]);
-  }catch(e){ toast(e.message); $('#skillSearchResults').innerHTML=`<div class="empty">${esc(e.message)}</div>`; }
+    else if($('#skillOutcomeDetail')) $('#skillOutcomeDetail').innerHTML='<div class="empty">No skill record selected.</div>';
+  }catch(e){
+    toast(e.message);
+    $('#skillSearchResults').innerHTML=`<div class="empty">${esc(e.message)}</div>`;
+  }
 }
-async function showSkillOutcome(skill){
-  const id=skill.skill_id||'';
-  const panel=$('#skillOutcomeDetail');
-  if(!panel) return;
-  panel.innerHTML=`<div class="detail"><h2>${esc(id||'Skill')}</h2><div class="meta-row">${(skill.applies_to||[]).map(x=>`<span class="pill">${esc(x)}</span>`).join('')}<span class="pill good">${esc(skill.skill_type||'skill')}</span></div><pre>${esc(skill.body||'No body')}</pre><div class="label">Outcome ledger</div><div id="skillOutcomeRows" class="memory-list"><div class="empty">Loading outcomes…</div></div></div>`;
-  if(!id) return;
+async function showSkillOutcome(hit){
+  const id=hit.skill_id||hit.rid||'';
+  const panel=$('#skillOutcomeDetail'); if(!panel) return;
+  if(!id){ panel.innerHTML='<div class="empty">The server result did not include a skill ID.</div>'; return; }
+  panel.innerHTML='<div class="empty">Loading exact skill record…</div>';
   try{
-    const data=await api(`/api/skill-recall/${encodeURIComponent(id)}/outcomes?limit=25`);
-    $('#skillOutcomeRows').innerHTML=(data.items||[]).map(o=>`<div class="memory-item"><div class="memory-title">${(o.metadata_json||{}).succeeded===false?'Failed':'Succeeded'} <span class="muted">${esc(o.created_at_iso||'')}</span></div><div class="memory-text">${esc((o.metadata_json||{}).note || o.text || '')}</div><div class="meta-row"><span class="pill">${esc(o.rid||'')}</span></div></div>`).join('') || '<div class="empty">No outcomes recorded for this skill yet.</div>';
-  }catch(e){ $('#skillOutcomeRows').innerHTML=`<div class="empty">${esc(e.message)}</div>`; }
+    const result=await api(`/api/skill-recall/${encodeURIComponent(id)}`);
+    const skill=result.skill||result;
+    const body=skill.body||skill.text||skill.content||hit.body||'';
+    const tags=Array.isArray(skill.applies_to)?skill.applies_to:(Array.isArray(hit.applies_to)?hit.applies_to:[]);
+    panel.innerHTML=`<div class="detail"><h2>${esc(skill.skill_id||id)}</h2><div class="meta-row">${tags.map(tag=>`<span class="pill">${esc(tag)}</span>`).join('')}<span class="pill good">${esc(skill.skill_type||hit.skill_type||'skill')}</span></div><pre>${esc(body||'No body was returned.')}</pre><div class="detail-section"><div class="label">Record an outcome</div><p class="muted">This writes one success/failure result to YantrikDB. Outcome history is not readable through the HTTP API.</p><textarea id="skillOutcomeContext" placeholder="Optional outcome context"></textarea><div class="toolbar compact"><button class="btn primary" id="skillOutcomeSuccess" type="button">Record success</button><button class="btn secondary" id="skillOutcomeFailure" type="button">Record failure</button></div></div></div>`;
+    $('#skillOutcomeSuccess')?.addEventListener('click',()=>recordSkillOutcome(id,true));
+    $('#skillOutcomeFailure')?.addEventListener('click',()=>recordSkillOutcome(id,false));
+  }catch(e){ panel.innerHTML=`<div class="empty">${esc(e.message)}</div>`; }
 }
-function skillAgeLabel(seconds){ if(seconds===null||seconds===undefined) return 'unknown age'; if(seconds<90) return `${seconds}s ago`; if(seconds<86400) return `${Math.round(seconds/3600)||1}h ago`; return `${Math.round(seconds/86400)}d ago`; }
-async function loadRecentSkills(){
-  const data=await api('/api/recent-skills?limit=25');
-  const items=data.items||[];
-  $('#recentSkillsStatus').textContent = data.surface_enabled ? `${fmt(items.length)} recent · surfacing on` : `${fmt(items.length)} recent · surfacing off`;
-  $('#recentSkillsList').innerHTML = items.map(s=>`<article class="memory-item skill-card"><div class="memory-title">${esc(s.skill_id||'skill')} <span class="muted">${esc(s.skill_type||'skill')}</span></div><div class="memory-text">${esc((s.applies_to||[]).join(', ')||'No scope tags')}</div><div class="meta-row"><span class="pill good">${esc(skillAgeLabel(s.age_seconds))}</span><span class="pill">session ${esc(s.session_id||'—')}</span></div></article>`).join('') || `<div class="empty helpful-empty"><strong>No recently learned skills yet.</strong><span>When YantrikDB records a new skill, it will show here for seven days.</span><code>${esc(data.path||'')}</code></div>`;
+async function recordSkillOutcome(id, success){
+  try{
+    const context=$('#skillOutcomeContext')?.value||'';
+    const result=await api(`/api/skill-recall/${encodeURIComponent(id)}/outcome`,{method:'POST',body:JSON.stringify({success,context})});
+    toast('YantrikDB recorded the skill outcome');
+    const panel=$('#skillOutcomeDetail');
+    panel?.insertAdjacentHTML('beforeend',`<details class="details-block"><summary>Outcome write response</summary><pre>${esc(JSON.stringify(result,null,2))}</pre></details>`);
+  }catch(e){ toast(e.message); }
 }
 
-async function loadConflicts(){ const data=await api(`/api/conflicts?namespace=${encodeURIComponent(ns())}&status=${encodeURIComponent($('#conflictStatus').value)}`); $('#conflictList').innerHTML=(data.items||[]).map(c=>`<div class="memory-item" data-id="${esc(c.conflict_id||c.id)}"><div class="memory-title">${esc(c.conflict_type||c.type||'conflict')} <span class="muted">${esc(c.status||'open')}</span></div><div class="memory-text">${esc(c.description||c.summary||JSON.stringify(c).slice(0,220))}</div><div class="meta-row"><span class="pill warn">priority ${esc(c.priority||'—')}</span><span class="pill">${esc(c.entity||'')}</span></div></div>`).join('') || '<div class="empty">No conflicts.</div>'; $$('#conflictList .memory-item').forEach(el=>el.onclick=()=>selectConflict(el.dataset.id)); }
-async function selectConflict(id){ const c=await api('/api/conflicts/'+encodeURIComponent(id)); $('#conflictDetail').innerHTML=`<div class="detail"><h2>Conflict ${esc(id)}</h2><pre>${esc(JSON.stringify(c,null,2))}</pre><div class="detail-section"><div class="label">Resolve</div><div class="toolbar compact"><select id="resolveStrategy"><option value="dismiss">dismiss</option><option value="keep_winner">keep_winner</option><option value="merge">merge</option><option value="keep_both">keep_both</option></select><input id="winnerRid" placeholder="winner rid"><input id="newText" placeholder="merged text"><button class="btn primary" onclick="resolveConflict('${esc(id)}')">Resolve</button></div></div></div>`; }
-async function resolveConflict(id){ try{ const body={strategy:$('#resolveStrategy').value,winner_rid:$('#winnerRid').value||null,new_text:$('#newText').value||null,resolution_note:'Resolved via YantrikDB for Hermes'}; const out=await api(`/api/conflicts/${encodeURIComponent(id)}/resolve`,{method:'POST',body:JSON.stringify(body)}); $('#conflictDetail').innerHTML=`<pre>${esc(JSON.stringify(out,null,2))}</pre>`; await loadConflicts(); }catch(e){toast(e.message)} }
-
-async function loadEntities(){ const data=await api(`/api/entities?q=${encodeURIComponent($('#entitySearch').value)}&limit=80`); $('#entityList').innerHTML=(data.items||[]).map(e=>`<div class="memory-item" data-name="${esc(e.name||e.entity||'')}"><div class="memory-title">${esc(e.name||e.entity)}</div><div class="meta-row"><span class="pill">${esc(e.entity_type||e.type||'entity')}</span><span class="pill">mentions ${fmt(e.mention_count||e.count||0)}</span></div></div>`).join('') || '<div class="empty helpful-empty"><strong>No entity index yet.</strong><span>Your current YantrikDB has memories, but no populated entity/edge rows. Use Recall for text search until relationships are written.</span></div>'; $$('#entityList .memory-item').forEach(el=>el.onclick=()=>{ $('#graphEntity').value=el.dataset.name; loadGraph(el.dataset.name); }); }
-async function loadGraph(entity){ if(!entity){toast('Enter/select entity');return;} const data=await api('/api/graph/'+encodeURIComponent(entity)+`?namespace=${encodeURIComponent(ns())}`); const empty=!(data.nodes?.length||data.edges?.length||data.memories?.length); $('#graphMeta').textContent=empty?`No graph data for ${entity}`:`${data.nodes.length} nodes · ${data.edges.length} edges`; drawGraph(data); $('#graphMemories').innerHTML=empty?'<div class="empty helpful-empty"><strong>No related memories for this entity.</strong><span>This graph only uses explicit YantrikDB entity links/relationship edges. Try Recall if you want normal semantic search.</span></div>':(data.memories||[]).map(memoryItem).join(''); }
-function drawGraph(g){ const svg=$('#graphSvg'); svg.innerHTML=''; const w=760,h=420,cx=w/2,cy=h/2; if(!(g.nodes?.length||g.edges?.length||g.memories?.length)){ svg.insertAdjacentHTML('beforeend',`<text class="graph-label graph-empty-label" x="${cx}" y="${cy}" text-anchor="middle">No entity graph data yet</text><text class="graph-label graph-empty-sub" x="${cx}" y="${cy+28}" text-anchor="middle">Use Recall for normal memory search</text>`); return; } const nodes=g.nodes.length?g.nodes:[{id:g.entity,label:g.entity}]; const pos={}; nodes.forEach((n,i)=>{ if(n.id===g.entity||i===0) pos[n.id]=[cx,cy]; else {const a=(i-1)/Math.max(1,nodes.length-1)*Math.PI*2; pos[n.id]=[cx+Math.cos(a)*260, cy+Math.sin(a)*150];}}); g.edges.forEach(e=>{const a=pos[e.source]||[cx,cy], b=pos[e.target]||[cx,cy]; svg.insertAdjacentHTML('beforeend',`<line class="graph-edge" x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}"/>`);}); nodes.forEach(n=>{const p=pos[n.id]; const root=n.id===g.entity||n.label===g.entity; svg.insertAdjacentHTML('beforeend',`<g><circle class="graph-node ${root?'graph-root':''}" cx="${p[0]}" cy="${p[1]}" r="${root?34:24}"></circle><text class="graph-label" x="${p[0]}" y="${p[1]+44}" text-anchor="middle">${esc(String(n.label||n.id).slice(0,22))}</text></g>`);}); }
+async function loadConflicts(){
+  try{
+    const data=await api(`/api/conflicts?namespace=${encodeURIComponent(ns())}&status=${encodeURIComponent($('#conflictStatus')?.value||'')}`);
+    const items=Array.isArray(data.items)?data.items:[];
+    $('#conflictList').innerHTML=items.map((conflict,index)=>`<div class="memory-item" data-index="${index}"><div class="memory-title">${esc(conflict.conflict_type||conflict.type||'Conflict')} <span class="muted">${esc(conflict.status||'unknown')}</span></div><div class="memory-text">${esc(conflict.description||conflict.summary||JSON.stringify(conflict).slice(0,220))}</div><div class="meta-row"><span class="pill warn">priority ${esc(conflict.priority??'—')}</span><span class="pill">${esc(conflict.entity||'')}</span></div></div>`).join('')||'<div class="empty">No conflicts were returned.</div>';
+    $$('#conflictList .memory-item').forEach((element,index)=>element.onclick=()=>selectConflict(items[index]));
+    if($('#conflictDetail')) $('#conflictDetail').innerHTML='<div class="empty">Select a conflict record returned by YantrikDB.</div>';
+  }catch(e){ $('#conflictList').innerHTML=`<div class="empty">${esc(e.message)}</div>`; }
+}
+function selectConflict(conflict){
+  const id=conflict.conflict_id||conflict.id||'';
+  const panel=$('#conflictDetail'); if(!panel) return;
+  const claims=[conflict.claim_a,conflict.claim_b,conflict.left,conflict.right].filter(Boolean);
+  const strategies=Array.isArray(conflict.allowed_strategies)?conflict.allowed_strategies:['dismiss','keep_winner','merge','keep_both'];
+  panel.innerHTML=`<div class="detail"><h2>Conflict ${esc(id||'')}</h2><pre>${esc(JSON.stringify(conflict,null,2))}</pre>${claims.length?`<div class="detail-section"><div class="label">Returned claims</div>${claims.map(claim=>`<div class="memory-item"><pre>${esc(JSON.stringify(claim,null,2))}</pre></div>`).join('')}</div>`:''}<div class="detail-section"><div class="label">Resolve</div><div class="toolbar compact"><select id="resolveStrategy">${strategies.map(strategy=>`<option value="${esc(strategy)}">${esc(strategy)}</option>`).join('')}</select><input id="winnerRid" placeholder="Winner RID (if required)"><input id="newText" placeholder="Merged text (if required)"><button class="btn primary" id="resolveConflictButton" type="button">Resolve</button></div></div></div>`;
+  $('#resolveConflictButton')?.addEventListener('click',()=>resolveConflict(id));
+}
+async function resolveConflict(id){
+  try{
+    const body={strategy:$('#resolveStrategy')?.value||'dismiss',winner_rid:$('#winnerRid')?.value||null,new_text:$('#newText')?.value||null,resolution_note:'Resolved via YantrikDB Dashboard'};
+    const result=await api(`/api/conflicts/${encodeURIComponent(id)}/resolve`,{method:'POST',body:JSON.stringify(body)});
+    $('#conflictDetail').innerHTML=`<pre>${esc(JSON.stringify(result,null,2))}</pre>`;
+    await loadConflicts();
+  }catch(e){ toast(e.message); }
+}
+async function loadEntities(){
+  if($('#entityList')) $('#entityList').innerHTML='<div class="empty helpful-empty"><strong>Entity index unavailable.</strong><span>YantrikDB exposes claims for a known entity but not an all-entities index. The dashboard will not infer entities from text.</span></div>';
+}
+async function loadGraph(){
+  if($('#graphMeta')) $('#graphMeta').textContent='Not available: no graph-edge read route in the current YantrikDB HTTP contract.';
+}
 
 function triggerId(t){ return t.trigger_id || t.id || ''; }
 function renderTrigger(t){
   const id=triggerId(t);
   const status=t.status || 'pending';
-  return `<div class="memory-item trigger-card"><div class="memory-title">${esc(t.trigger_type||t.type||'trigger')} <span class="muted">${esc(status)}</span></div><div class="memory-text">${esc(t.reason||t.description||JSON.stringify(t).slice(0,220))}</div><div class="meta-row"><span class="pill warn">urgency ${Number(t.urgency||0).toFixed(2)}</span><span class="pill">${esc(t.suggested_action||'review')}</span><span class="pill">${esc(id)}</span></div>${status==='pending'&&id?`<div class="trigger-actions"><button class="btn secondary tiny" onclick="acknowledgeTrigger('${esc(id)}')">Acknowledge</button><button class="btn ghost tiny" onclick="dismissTrigger('${esc(id)}')">Dismiss</button><button class="btn primary tiny" onclick="actOnTrigger('${esc(id)}')">Mark acted</button></div>`:''}<details class="details-block"><summary>Trigger details</summary><pre>${esc(JSON.stringify(t,null,2))}</pre></details></div>`;
+  return `<div class="memory-item trigger-card"><div class="memory-title">${esc(t.trigger_type||t.type||'trigger')} <span class="muted">${esc(status)}</span></div><div class="memory-text">${esc(t.reason||t.description||JSON.stringify(t).slice(0,220))}</div><div class="meta-row"><span class="pill warn">urgency ${Number(t.urgency||0).toFixed(2)}</span><span class="pill">${esc(t.suggested_action||'review')}</span><span class="pill">${esc(id)}</span></div>${status==='pending'&&id?`<div class="trigger-actions"><button class="btn secondary tiny" data-trigger-action="acknowledge" data-trigger-id="${esc(id)}">Acknowledge</button><button class="btn ghost tiny" data-trigger-action="dismiss" data-trigger-id="${esc(id)}">Dismiss</button><button class="btn primary tiny" data-trigger-action="act" data-trigger-id="${esc(id)}">Mark acted</button></div>`:''}<details class="details-block"><summary>Trigger details</summary><pre>${esc(JSON.stringify(t,null,2))}</pre></details></div>`;
 }
 async function triggerAction(id, action, label){
   try{ await api(`/api/triggers/${encodeURIComponent(id)}/${action}`,{method:'POST',body:'{}'}); toast(label); await loadLifecycle(); }
@@ -833,26 +606,76 @@ async function triggerAction(id, action, label){
 async function acknowledgeTrigger(id){ return triggerAction(id,'acknowledge','Trigger acknowledged'); }
 async function dismissTrigger(id){ if(!await confirmAction('Dismiss trigger?','This closes the trigger without recording follow-up action. Admin Mode must be enabled.')) return; return triggerAction(id,'dismiss','Trigger dismissed'); }
 async function actOnTrigger(id){ return triggerAction(id,'act','Trigger marked acted-on'); }
+function unavailableList(error){ return `<div class="empty helpful-empty"><strong>Unavailable</strong><span>${esc(error)}</span></div>`; }
+async function getCapability(path){
+  try{ return {data:await api(path),error:null}; }
+  catch(error){ return {data:null,error:error.message||String(error)}; }
+}
 async function loadLifecycle(){
-  const [stale,upcoming,patterns,triggers]=await Promise.all([api(`/api/stale?namespace=${encodeURIComponent(ns())}`),api(`/api/upcoming?namespace=${encodeURIComponent(ns())}`),api('/api/patterns'),api('/api/triggers')]);
-  $('#lifecycleCards').innerHTML=[['Stale candidates',stale.items?.length||0],['Upcoming',upcoming.items?.length||0],['Patterns',patterns.items?.length||0],['Triggers',triggers.items?.length||0]].map(m=>`<div class="stat-card"><div class="stat-label">${m[0]}</div><div class="stat-value">${fmt(m[1])}</div></div>`).join('');
-  $('#staleList').innerHTML=(stale.items||[]).map(memoryItem).join('')||'<div class="empty">No stale memories.</div>';
-  $('#upcomingList').innerHTML=(upcoming.items||[]).map(memoryItem).join('')||'<div class="empty">No upcoming memories.</div>';
-  $('#patternList').innerHTML=(patterns.items||[]).map(x=>`<div class="memory-item"><div class="memory-title">${esc(x.pattern_type||x.type||'pattern')}</div><pre>${esc(JSON.stringify(x,null,2))}</pre></div>`).join('')||'<div class="empty">No patterns.</div>';
-  $('#triggerList').innerHTML=(triggers.items||[]).map(renderTrigger).join('')||'<div class="empty">No triggers.</div>';
+  const requests=await Promise.all([
+    getCapability(`/api/stale?namespace=${encodeURIComponent(ns())}`),
+    getCapability(`/api/upcoming?namespace=${encodeURIComponent(ns())}`),
+    getCapability('/api/patterns'),
+    getCapability('/api/triggers?limit=50'),
+  ]);
+  const [stale,upcoming,patterns,triggers]=requests;
+  const countOf=result=>result.error?'—':fmt((result.data?.items||[]).length);
+  if($('#lifecycleCards')) $('#lifecycleCards').innerHTML=[['Stale candidates',countOf(stale)],['Upcoming',countOf(upcoming)],['Patterns',countOf(patterns)],['Triggers',countOf(triggers)]].map(([label,value])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(value)}</div></div>`).join('');
+  if($('#staleList')) $('#staleList').innerHTML=stale.error?unavailableList(stale.error):((stale.data?.items||[]).map(memoryItem).join('')||'<div class="empty">No stale memories returned.</div>');
+  if($('#upcomingList')) $('#upcomingList').innerHTML=upcoming.error?unavailableList(upcoming.error):((upcoming.data?.items||[]).map(memoryItem).join('')||'<div class="empty">No upcoming memories returned.</div>');
+  if($('#patternList')) $('#patternList').innerHTML=patterns.error?unavailableList(patterns.error):((patterns.data?.items||[]).map(item=>`<div class="memory-item"><div class="memory-title">${esc(item.pattern_type||item.type||'pattern')}</div><pre>${esc(JSON.stringify(item,null,2))}</pre></div>`).join('')||'<div class="empty">No patterns returned.</div>');
+  if($('#triggerList')) {
+    $('#triggerList').innerHTML=triggers.error?unavailableList(triggers.error):((triggers.data?.items||[]).map(renderTrigger).join('')||'<div class="empty">No triggers returned.</div>');
+    $$('[data-trigger-action]').forEach(button=>button.addEventListener('click',()=>{
+      const id=button.dataset.triggerId||'';
+      if(button.dataset.triggerAction==='acknowledge') acknowledgeTrigger(id);
+      else if(button.dataset.triggerAction==='dismiss') dismissTrigger(id);
+      else if(button.dataset.triggerAction==='act') actOnTrigger(id);
+    }));
+  }
 }
-async function runThink(){ if(!await confirmAction('Run maintenance pass?','This will run housekeeping on the selected memory scope. Admin Mode must be enabled.'))return; const btn=$('#runThink'); const oldText=btn?.textContent; try{ if(btn){btn.disabled=true;btn.textContent='Running…';} $('#opsDetails')?.setAttribute('open',''); $('#opsOutput').textContent='Running maintenance…'; const out=await api('/api/think',{method:'POST',body:JSON.stringify({run_consolidation:true,run_conflict_scan:true,run_pattern_mining:false,run_personality:false})}); $('#opsOutput').textContent=JSON.stringify(out,null,2); toast('Maintenance complete'); await loadStats(); }catch(e){$('#opsDetails')?.setAttribute('open',''); $('#opsOutput').textContent=e.message; toast(e.message);} finally{ if(btn){btn.disabled=false;btn.textContent=oldText||'Run pass';} } }
-function renderHygieneCandidate(item){ return `<div class="memory-item"><div class="memory-title">${esc(item.rid||'memory')} <span class="pill warn">surfaced ${fmt(item.surfaced||0)}</span></div><div class="memory-text">Never reinforced in recall feedback${item.age_seconds!=null?` · last seen ${fmt(Math.round(item.age_seconds/60))}m ago`:''}</div><div class="toolbar compact"><button class="btn secondary" onclick="showSelectableCopy('RID','${esc(item.rid||'')}')">Copy RID</button></div></div>`; }
-function renderHygiene(h, fb){
-  const hs=h?.summary||{}; const fs=fb?.summary||{};
-  if($('#hygieneCards')) $('#hygieneCards').innerHTML=[['Open conflicts',hs.open_conflicts||0],['Low-usefulness',hs.low_usefulness||0],['Active',hs.active_memories||0],['Forgotten',hs.tombstoned_memories||0]].map(m=>`<div class="stat-card"><div class="stat-label">${m[0]}</div><div class="stat-value">${fmt(m[1])}</div></div>`).join('');
-  if($('#recallFeedbackCards')) $('#recallFeedbackCards').innerHTML=[['Tracked recall rids',fs.tracked||0],['Surfaced',fs.surfaced||0],['Reinforced',fs.reinforced||0],['Low signal',fs.low_usefulness||0]].map(m=>`<div class="stat-card"><div class="stat-label">${m[0]}</div><div class="stat-value">${fmt(m[1])}</div></div>`).join('');
-  const candidates=h?.low_usefulness_candidates||[];
-  if($('#hygieneList')) $('#hygieneList').innerHTML=candidates.map(renderHygieneCandidate).join('') || '<div class="empty helpful-empty"><strong>No v0.6 hygiene candidates.</strong><span>Self-tuning recall feedback has not marked any repeated, unrewarded memories yet.</span></div>';
+async function runThink(){
+  if(ns()!==ALL_NAMESPACES){ toast('Select All namespaces; this server maintenance endpoint is database-wide.'); return; }
+  if(!await confirmAction('Run maintenance pass?','This runs the YantrikDB server-wide maintenance operation. Admin Mode must be enabled.')) return;
+  const button=$('#runThink'); const oldText=button?.textContent;
+  try{
+    if(button){button.disabled=true;button.textContent='Running…';}
+    $('#opsDetails')?.setAttribute('open',''); $('#opsOutput').textContent='Running server-wide maintenance…';
+    const result=await api('/api/think',{method:'POST',body:JSON.stringify({run_consolidation:true,run_conflict_scan:true,run_pattern_mining:false,run_personality:false,namespace:ALL_NAMESPACES})});
+    $('#opsOutput').textContent=JSON.stringify(result,null,2); toast('Maintenance response received from YantrikDB'); await loadStats();
+  }catch(error){ $('#opsDetails')?.setAttribute('open',''); $('#opsOutput').textContent=error.message; toast(error.message); }
+  finally{ if(button){button.disabled=false;button.textContent=oldText||'Run pass';} }
 }
-async function loadHygienePanel(){ const [h,fb]=await Promise.all([api(`/api/hygiene?namespace=${encodeURIComponent(ns())}`),api('/api/recall-feedback?limit=25')]); renderHygiene(h,fb); return h; }
-async function runHygieneScan(){ const btn=$('#runHygieneScan'); const oldText=btn?.textContent; try{ if(btn){btn.disabled=true;btn.textContent='Scanning…';} const h=await loadHygienePanel(); $('#opsDetails')?.setAttribute('open',''); $('#opsOutput').textContent=JSON.stringify(h,null,2); toast('Hygiene scan complete'); }catch(e){ $('#opsDetails')?.setAttribute('open',''); $('#opsOutput').textContent=e.message; toast(e.message); } finally{ if(btn){btn.disabled=false;btn.textContent=oldText||'Scan';} } }
-async function loadHealthPanel(){ const [h]=await Promise.all([api('/api/health'), loadHygienePanel().catch(e=>({error:e.message}))]); $('#healthPayload').textContent=JSON.stringify(h,null,2); }
+function renderHygiene(hygiene){
+  const summary=hygiene?.summary||{};
+  if($('#hygieneCards')) $('#hygieneCards').innerHTML=[
+    ['Open conflicts',summary.open_conflicts],
+    ['Low-usefulness','Not exposed'],
+    ['Active memories',summary.active_memories],
+    ['Forgotten',summary.tombstoned_memories],
+  ].map(([label,value])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(fmt(value))}</div></div>`).join('');
+  if($('#recallFeedbackCards')) $('#recallFeedbackCards').innerHTML='<div class="stat-card"><div class="stat-label">Recall feedback</div><div class="stat-value">Not exposed by server</div></div>';
+  const conflicts=Array.isArray(hygiene?.open_conflicts)?hygiene.open_conflicts:[];
+  if($('#hygieneList')) $('#hygieneList').innerHTML=conflicts.map(item=>`<div class="memory-item"><div class="memory-title">${esc(item.conflict_type||item.type||'Conflict')} <span class="muted">${esc(item.status||'open')}</span></div><pre>${esc(JSON.stringify(item,null,2))}</pre></div>`).join('')||'<div class="empty helpful-empty"><strong>No open conflicts returned.</strong><span>Low-usefulness candidates are unavailable because the server does not expose recall-feedback history.</span></div>';
+}
+async function loadHygienePanel(){ const hygiene=await api(`/api/hygiene?namespace=${encodeURIComponent(ns())}`); renderHygiene(hygiene); return hygiene; }
+async function runHygieneScan(){
+  const button=$('#runHygieneScan'); const oldText=button?.textContent;
+  try{
+    if(button){button.disabled=true;button.textContent='Scanning…';}
+    const hygiene=await loadHygienePanel(); $('#opsDetails')?.setAttribute('open',''); $('#opsOutput').textContent=JSON.stringify(hygiene,null,2); toast('YantrikDB hygiene data loaded');
+  }catch(error){ $('#opsDetails')?.setAttribute('open',''); $('#opsOutput').textContent=error.message; toast(error.message); }
+  finally{ if(button){button.disabled=false;button.textContent=oldText||'Scan';} }
+}
+async function loadHealthPanel(){
+  try{
+    const health=await api('/api/health');
+    state.health={...state.health,...health};
+    await loadIdentityScope();
+    if($('#healthPayload')) $('#healthPayload').textContent=JSON.stringify({...health,namespaces:state.health.namespaces||[]},null,2);
+    updateScopeUi();
+  }catch(error){ if($('#healthPayload')) $('#healthPayload').textContent=error.message; }
+}
 
 
 // Direct Mnemosyne Three.js visualiser port. Keep this close to mnemosyne-dashboard/static/app.js.
