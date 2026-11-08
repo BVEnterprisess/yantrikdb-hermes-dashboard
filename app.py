@@ -433,7 +433,7 @@ class LoginRequest(BaseModel):
 
 class SupabaseSessionRequest(BaseModel):
     access_token: str = Field(min_length=1, max_length=8192)
-    expires_in: int = Field(default=3600, ge=60, le=86400)
+    expires_in: int = Field(default=3600, ge=1, le=86400)
 
 
 class SettingsRequest(BaseModel):
@@ -514,7 +514,7 @@ async def password_gate(request: Request, call_next):
                 return JSONResponse(status_code=401, content={"detail": "Supabase session expired; sign in again"})
             return RedirectResponse(url="/login", status_code=303)
         request.state.supabase_authenticated = True
-    elif path.startswith("/api/") and path not in public_paths:
+    elif path.startswith("/api/") and not path.startswith("/api/auth/"):
         # Retain the local password gate for deployments that intentionally
         # disable Supabase Auth during development.
         settings = load_dashboard_settings()
